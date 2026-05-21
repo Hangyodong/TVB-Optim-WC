@@ -40,27 +40,16 @@ def load_data(cfg: Config) -> dict:
     n_nodes = weights.shape[0]
     _validate_shapes(weights, lengths, fc_target, region_labels, n_nodes)
 
-    # === Patch 8: SC Preprocessing 재설계 ===
-    # 1. non-finite / negative 제거
-    weights = np.where(
-        np.isfinite(weights) & (weights >= 0),
-        weights, 0.0,
-    )
-    # 2. symmetrize
-    weights = 0.5 * (weights + weights.T)
-    # 3. diagonal = 0
     np.fill_diagonal(weights, 0.0)
-    # 4. sc_mask 재생성 (symmetrize 이후)
     sc_mask = (weights > 0).astype(np.float32)
+
     if sc_mask.sum() == 0:
         raise RuntimeError("SC has no positive edges to use as a sparse mask.")
-    # 5. log1p (offset 없음 → 0 연결 보존)
-    weights = np.log1p(weights)
-    # 6. in-degree normalization (row_sum 기준)
-    row_sum = weights.sum(axis=1, keepdims=True)
-    row_sum = np.where(row_sum > 0, row_sum, 1.0)
-    weights = weights / row_sum
-    # 7. sc_mask 재적용
+
+    weights = np.log1p(weights + 0.5)
+    weights_max = float(np.max(weights))
+    if weights_max > 0:
+        weights = weights / weights_max
     weights = weights * sc_mask
 
     delays = lengths / cfg.tract_conduction_speed
