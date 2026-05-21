@@ -110,8 +110,7 @@ class ParamSet:
 
     @classmethod
     def default(cls, n_nodes: int, c_ei_init: float = 6.0) -> "ParamSet":
-        # Patch 7: wLRE/wFFI are per-node (n_nodes,) instead of (n_nodes, n_nodes).
-        ones = np.ones((n_nodes,), dtype=np.float32)
+        ones = np.ones((n_nodes, n_nodes), dtype=np.float32)
         return cls(
             c_ei=np.full(n_nodes, c_ei_init, dtype=np.float32),
             wLRE=ones.copy(),
@@ -464,10 +463,6 @@ def _clean_c_ei(values: np.ndarray) -> np.ndarray:
 def _clean_weight_matrix(values: np.ndarray, sc_mask: np.ndarray, w_max: float) -> np.ndarray:
     values = np.nan_to_num(values, nan=0.0, posinf=w_max, neginf=0.0)
     values = np.clip(np.asarray(values, dtype=np.float32), 0.0, w_max)
-    # Patch 7: per-node (n_nodes,) skips sc_mask multiply / symmetrize; full
-    # (n_nodes, n_nodes) keeps the legacy SC-masked symmetric matrix path.
-    if values.ndim == 1:
-        return values.astype(np.float32)
     values = values * np.asarray(sc_mask, dtype=np.float32)
     return (0.5 * (values + values.T)).astype(np.float32)
 

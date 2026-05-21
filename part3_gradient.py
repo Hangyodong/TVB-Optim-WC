@@ -161,13 +161,12 @@ def _run_full_gradient_pure(
         sim = compiled_model(state)
         bold = bold_monitor_opt(sim)
         fc = _compute_fc_differentiable(bold, cfg.optimizer_bold_skip_tr)
-        # Patch 9: 3-term loss
         L_global   = _compute_correlation_loss(fc, fc_target_safe)
         L_nodewise = _compute_nodewise_corr_loss(fc, fc_target_safe)
         L_rmse     = _compute_rmse_loss(fc, fc_target_safe)
         act_l      = _compute_activity_regularization(sim, cfg)
         return (
-            cfg.optimizer_global_corr_weight   * L_global
+            cfg.optimizer_global_corr_weight     * L_global
             + cfg.optimizer_nodewise_corr_weight * L_nodewise
             + cfg.optimizer_rmse_weight          * L_rmse
             + 0.01 * act_l
@@ -177,13 +176,12 @@ def _run_full_gradient_pure(
         sim = compiled_model(state)
         bold = bold_monitor_opt(sim)
         fc = _compute_fc_differentiable(bold, cfg.optimizer_bold_skip_tr)
-        # Patch 9: 3-term loss
         L_global   = _compute_correlation_loss(fc, fc_target_safe)
         L_nodewise = _compute_nodewise_corr_loss(fc, fc_target_safe)
         L_rmse     = _compute_rmse_loss(fc, fc_target_safe)
         act_l      = _compute_activity_regularization(sim, cfg)
         total = (
-            cfg.optimizer_global_corr_weight   * L_global
+            cfg.optimizer_global_corr_weight     * L_global
             + cfg.optimizer_nodewise_corr_weight * L_nodewise
             + cfg.optimizer_rmse_weight          * L_rmse
             + 0.01 * act_l
@@ -360,13 +358,10 @@ def _run_lowrank_pure(
     )
 
     def _reconstruct_weights(trainable: LowRankTrainable):
-        # Patch 7: per-node base (n_nodes,) broadcast to (n_nodes, n_nodes), then add NxN low-rank delta.
         delta_lre = delta_scale * (trainable.lre_u @ trainable.lre_v.T)
         delta_ffi = delta_scale * (trainable.ffi_u @ trainable.ffi_v.T)
-        wLRE_base_mat = jnp.asarray(wLRE_base)[:, None] * jnp.ones_like(delta_lre)
-        wFFI_base_mat = jnp.asarray(wFFI_base)[:, None] * jnp.ones_like(delta_ffi)
-        wLRE_eff = jnp.clip(wLRE_base_mat + delta_lre, 0.0, w_max) * sc_mask_jnp
-        wFFI_eff = jnp.clip(wFFI_base_mat + delta_ffi, 0.0, w_max) * sc_mask_jnp
+        wLRE_eff = jnp.clip(jnp.asarray(wLRE_base) + delta_lre, 0.0, w_max) * sc_mask_jnp
+        wFFI_eff = jnp.clip(jnp.asarray(wFFI_base) + delta_ffi, 0.0, w_max) * sc_mask_jnp
         wLRE_eff = 0.5 * (wLRE_eff + wLRE_eff.T)
         wFFI_eff = 0.5 * (wFFI_eff + wFFI_eff.T)
         return wLRE_eff, wFFI_eff
@@ -383,7 +378,6 @@ def _run_lowrank_pure(
         bold = bold_monitor_lr(sim)
         fc = _compute_fc_differentiable(bold, cfg.lowrank_bold_skip_tr)
 
-        # Patch 9: 3-term loss (lowrank)
         L_global   = _compute_correlation_loss(fc, fc_target_safe)
         L_nodewise = _compute_nodewise_corr_loss(fc, fc_target_safe)
         L_rmse     = _compute_rmse_loss(fc, fc_target_safe)
@@ -393,7 +387,7 @@ def _run_lowrank_pure(
             + jnp.mean(trainable.ffi_u ** 2) + jnp.mean(trainable.ffi_v ** 2)
         )
         return (
-            cfg.lowrank_global_corr_weight   * L_global
+            cfg.lowrank_global_corr_weight     * L_global
             + cfg.lowrank_nodewise_corr_weight * L_nodewise
             + cfg.lowrank_rmse_weight          * L_rmse
             + cfg.lowrank_activity_weight * act_l
@@ -769,17 +763,12 @@ def _compute_correlation_loss(predicted: jnp.ndarray, target: jnp.ndarray) -> jn
 def _compute_nodewise_corr_loss(
     predicted: jnp.ndarray, target: jnp.ndarray
 ) -> jnp.ndarray:
-    """Patch 9: node-wise FC profile correlation loss.
-
-    Each node's FC row is treated as an independent profile. Off-diagonal
-    Pearson correlation is computed per row, then averaged.
-    """
     n = predicted.shape[0]
     mask = 1.0 - jnp.eye(n, dtype=predicted.dtype)
 
     def _row_corr(i):
         x = predicted[i] * mask[i]
-        y = target[i] * mask[i]
+        y = target[i]    * mask[i]
         n_eff = jnp.maximum(mask[i].sum(), 1.0)
         xm = x - jnp.sum(x) / n_eff
         ym = y - jnp.sum(y) / n_eff
@@ -797,7 +786,6 @@ def _compute_nodewise_corr_loss(
 def _compute_rmse_loss(
     predicted: jnp.ndarray, target: jnp.ndarray
 ) -> jnp.ndarray:
-    """Patch 9: off-diagonal RMSE loss (differentiable, JAX)."""
     mask = 1.0 - jnp.eye(predicted.shape[0], dtype=predicted.dtype)
     diff = (predicted - target) * mask
     n = jnp.maximum(mask.sum(), 1.0)

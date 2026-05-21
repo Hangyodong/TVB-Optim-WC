@@ -555,13 +555,11 @@ def _eib_update_rule(
     sc_mask: np.ndarray,
     w_max: float,
 ):
-    # Patch 7: per-node update (wLRE/wFFI shape: (n_nodes,)).
-    fc_diff  = jnp.where(jnp.isfinite(fc_target - fc_pred), fc_target - fc_pred, 0.0)
-    row_err  = jnp.mean(fc_diff, axis=1)               # (n_nodes,)
-    row_rmse = rmse(fc_target, fc_pred, axis=1)         # (n_nodes,)
+    fc_diff = jnp.where(jnp.isfinite(fc_target - fc_pred), fc_target - fc_pred, 0.0)
+    row_rmse = rmse(fc_target, fc_pred, axis=1)[:, None]
     row_rmse = jnp.where(jnp.isfinite(row_rmse), row_rmse, 0.0)
-    wLRE_new = _clip_pernode(wLRE + eta_eib * row_err * row_rmse, w_max)
-    wFFI_new = _clip_pernode(wFFI - eta_eib * row_err * row_rmse, w_max)
+    wLRE_new = _clip_sym(wLRE + eta_eib * fc_diff * row_rmse, sc_mask, w_max)
+    wFFI_new = _clip_sym(wFFI - eta_eib * fc_diff * row_rmse, sc_mask, w_max)
     return wLRE_new, wFFI_new
 
 
@@ -569,11 +567,6 @@ def _clip_sym(w, sc_mask: np.ndarray, w_max: float):
     w = jnp.where(jnp.isfinite(w), w, 0.0)
     w = jnp.clip(w, 0.0, w_max) * jnp.asarray(sc_mask)
     return 0.5 * (w + w.T)
-
-
-def _clip_pernode(w, w_max: float):  # Patch 7: per-node clip
-    w = jnp.where(jnp.isfinite(w), w, 0.0)
-    return jnp.clip(w, 0.0, w_max)
 
 
 def _select_block(matrix, indices: np.ndarray):

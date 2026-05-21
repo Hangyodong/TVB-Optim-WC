@@ -34,14 +34,14 @@ class WilsonCowanEIB(AbstractDynamics):
 
     DEFAULT_PARAMS = Bunch(
         tau_e=10.0, tau_i=10.0,
-        c_ee=10.0, c_ei=6.0, c_ie=10.0, c_ii=1.0,
+        c_ee=12.0, c_ei=10.0, c_ie=12.0, c_ii=3.0,
         a_e=1.0, a_i=1.0,
         b_e=0.0, b_i=0.0,
         c_e=1.0, c_i=1.0,
         alpha_e=1.2, alpha_i=2.0,
         theta_e=2.0, theta_i=3.5,
         k_e=1.0, k_i=1.0,
-        r_e=1.0, r_i=1.0,
+        r_e=0.0, r_i=0.0,
         P=0.5, Q=0.0, I_ext=0.0,
         lamda=1.0,
         rE_max_hz=20.0, rI_max_hz=20.0,
@@ -114,16 +114,8 @@ class EIBLinearCoupling(InstantaneousCoupling):
 
     def pre(self, incoming_states, local_states, params):
         source_excitation = incoming_states[0]
-        # Patch 7: support per-node (n_target,) and full (n_target, n_source) shapes;
-        # per-node weights are broadcast across the source axis.
-        wLRE = params.wLRE
-        wFFI = params.wFFI
-        if wLRE.ndim == 1:
-            wLRE = wLRE[:, None]
-        if wFFI.ndim == 1:
-            wFFI = wFFI[:, None]
         return jnp.stack(
-            [source_excitation * wLRE, source_excitation * wFFI],
+            [source_excitation * params.wLRE, source_excitation * params.wFFI],
             axis=0,
         )
 
@@ -150,8 +142,8 @@ def build_network(cfg: Config, data: dict) -> tuple:
     )
 
     coupling = EIBLinearCoupling(incoming_states=["E"])
-    coupling.params.wLRE = jnp.ones((n_nodes,), dtype=jnp.float32)
-    coupling.params.wFFI = jnp.ones((n_nodes,), dtype=jnp.float32)
+    coupling.params.wLRE = jnp.ones((n_nodes, n_nodes), dtype=jnp.float32)
+    coupling.params.wFFI = jnp.ones((n_nodes, n_nodes), dtype=jnp.float32)
 
     noise = AdditiveNoise(sigma=cfg.additive_noise_sigma, apply_to="E")
 

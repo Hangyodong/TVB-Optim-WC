@@ -25,7 +25,7 @@ class Config:
     fc_csv:         str = "FC_compact.csv"
     cache_root_dir: str = "./cache"
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12"
 
     # ── 시뮬레이션 공통 ──────────────────────────────────────
     integration_dt_ms:       float = 1.0
