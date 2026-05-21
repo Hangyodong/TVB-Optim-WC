@@ -1,0 +1,17 @@
+cache/
+optimized_params/
+dbs_analysis/
+paper_dbs_psd_*/
+paper_figures_*/
+all_figures_export_*/
+*.csv
+*.txt
+*.patch*_backup
+*.backup
+patch*.py
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.DS_Store
+*.swp
