@@ -25,12 +25,21 @@ class Config:
     fc_csv:         str = "FC_compact.csv"
     cache_root_dir: str = "./cache"
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14"
 
     # ── 시뮬레이션 공통 ──────────────────────────────────────
     integration_dt_ms:       float = 1.0
     warmup_duration_ms:      int   = 300_000
     bold_repetition_time_ms: float = 1000.0
+
+    # ── Bold monitor HRF parameters (Patch 13) ──────────────
+    # Calibrate to match mouse HRF target
+    bold_hrf_k1          : float = 5.6
+    bold_hrf_V0          : float = 0.02
+    bold_hrf_tau_s       : float = 0.8        # seconds
+    bold_hrf_tau_f       : float = 0.4        # seconds
+    bold_hrf_scaling     : float = 1.0 / 3.0
+    bold_hrf_duration_ms : float = 32_000.0   # ms (32s for mouse)
     tract_conduction_speed:  float = 3.0
     additive_noise_sigma:    float = 0.01
     bundle_rng_seed:         int   = 42

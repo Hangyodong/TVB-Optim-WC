@@ -31,21 +31,34 @@ class WilsonCowanEIB(AbstractDynamics):
     STATE_NAMES = ("E", "I")
     INITIAL_STATE = (0.2, 0.1)
     AUXILIARY_NAMES = ("S_e", "S_i", "rE_hz", "rI_hz")
-
     DEFAULT_PARAMS = Bunch(
-        tau_e=10.0, tau_i=10.0,
-        c_ee=12.0, c_ei=10.0, c_ie=12.0, c_ii=3.0,
-        a_e=1.0, a_i=1.0,
-        b_e=0.0, b_i=0.0,
-        c_e=1.0, c_i=1.0,
-        alpha_e=1.2, alpha_i=2.0,
-        theta_e=2.0, theta_i=3.5,
-        k_e=1.0, k_i=1.0,
-        r_e=0.0, r_i=0.0,
-        P=0.5, Q=0.0, I_ext=0.0,
-        lamda=1.0,
-        rE_max_hz=20.0, rI_max_hz=20.0,
-    )
+    tau_e=10.0,
+    tau_i=10.0,
+    c_ee=11.0,
+    c_ei=10.0,
+    c_ie=10.0,
+    c_ii=1.0,
+    a_e=1.0,
+    a_i=1.0,
+    b_e=0.0,
+    b_i=0.0,
+    c_e=1.0,
+    c_i=1.0,
+    alpha_e=1.2,
+    alpha_i=2.0,
+    theta_e=2.0,
+    theta_i=3.5,
+    k_e=1.0,
+    k_i=1.0,
+    r_e=1.0,
+    r_i=1.0,
+    P=0.5,
+    Q=0.0,
+    I_ext=0.0,
+    lamda=1.0,
+    rE_max_hz=20.0,
+    rI_max_hz=20.0,
+)
 
     COUPLING_INPUTS = {"coupling": 2}
 
