@@ -274,7 +274,7 @@ def _coerce_fic_bundle(
     if initial_state is None or bold_monitor is None or warmup_result is None:
         raise ValueError("run_fic requires either bundle_in or (initial_state, bold_monitor, warmup_result).")
 
-    initial_params = ParamSet.default(data["n_nodes"]).sanitize(
+    initial_params = ParamSet.default(data["n_nodes"], c_ei_init=10.0).sanitize(
         data["sc_mask"], cfg.connectivity_weight_max
     )
 

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from tvboptim.experimental.network_dynamics import prepare
-from tvboptim.observations.tvb_monitors.bold import Bold
+from tvboptim.observations.tvb_monitors.bold import Bold, LotkaVolterraHRFKernel
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ class ParamSet:
         )
 
     @classmethod
-    def default(cls, n_nodes: int, c_ei_init: float = 6.0) -> "ParamSet":
+    def default(cls, n_nodes: int, c_ei_init: float = 10.0) -> "ParamSet":
         ones = np.ones((n_nodes, n_nodes), dtype=np.float32)
         return cls(
             c_ei=np.full(n_nodes, c_ei_init, dtype=np.float32),
@@ -320,11 +320,21 @@ class StateBundle:
         return compiled_model, tvb_state
 
     def build_bold_monitor(self, cfg) -> Bold:
+        # Patch 13: custom HRF kernel parameters
+        _hrf_kernel = LotkaVolterraHRFKernel(
+            tau_s    = getattr(cfg, "bold_hrf_tau_s",    0.8),
+            tau_f    = getattr(cfg, "bold_hrf_tau_f",    0.4),
+            scaling  = getattr(cfg, "bold_hrf_scaling",  1.0 / 3.0),
+            duration = getattr(cfg, "bold_hrf_duration_ms", 32_000.0),
+        )
         monitor = Bold(
             period=cfg.bold_repetition_time_ms,
             downsample_period=4.0,
             voi=0,
             history=None,
+            k_1    = getattr(cfg, "bold_hrf_k1", 5.6),
+            V_0    = getattr(cfg, "bold_hrf_V0", 0.02),
+            kernel = _hrf_kernel,
         )
         if self._bold_history is None:
             return monitor
