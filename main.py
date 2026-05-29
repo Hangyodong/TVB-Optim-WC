@@ -29,6 +29,47 @@ print(f"jax_enable_x64 : {jax.config.jax_enable_x64}")
 import matplotlib
 matplotlib.use("Agg")  # 화면 없이 저장만
 
+import matplotlib.pyplot as _plt
+import datetime as _dt, pathlib as _pl, re as _re
+
+# 실행 시각 기반 출력 폴더 생성
+_FIG_DIR = _pl.Path(f"figures_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+_FIG_DIR.mkdir(exist_ok=True)
+_fig_counter = {"n": 0}
+
+def _slugify(text):
+    return _re.sub(r"[^\w가-힣\-]", "_", text.strip())[:60] or "figure"
+
+def _get_label(fig, idx):
+    try:
+        t = fig._suptitle.get_text()
+        if t: return _slugify(t)
+    except Exception: pass
+    for ax in fig.axes:
+        try:
+            t = ax.get_title()
+            if t: return _slugify(t)
+        except Exception: pass
+    return f"figure_{idx:03d}"
+
+if not hasattr(_plt, "_main_original_show"):
+    _plt._main_original_show = _plt.show
+
+def _patched_show(*args, **kwargs):
+    for fn in _plt.get_fignums():
+        fig = _plt.figure(fn)
+        _fig_counter["n"] += 1
+        n = _fig_counter["n"]
+        label = _get_label(fig, n)
+        out = _FIG_DIR / f"{n:03d}_{label}.png"
+        fig.savefig(str(out), dpi=150, bbox_inches="tight")
+        print(f"  [fig] {out}")
+    _plt._main_original_show(*args, **kwargs)
+
+_plt.show = _patched_show
+print(f"[FIG] 출력 폴더: {_FIG_DIR.resolve()}")
+
+
 from config              import Config
 from data_loader         import load_data
 from model               import build_network
@@ -78,7 +119,7 @@ _DATASET_PARAMS = {
         fic_target_firing_rate_hz=4.0,
         sc_csv="weight.csv",
         length_csv="tract_length.csv",
-        fc_csv="FC_compact.csv",
+        fc_csv="fc_matrix.csv",
         region_txt="Atlas_43.txt",
         tract_conduction_speed=1.0,
         additive_noise_sigma=0.01,
@@ -239,6 +280,11 @@ def main():
     # Data loading (Cell 7)
     print("\n[0] Loading data...")
     data = load_data(cfg)
+
+    # fc_target 대각 행렬 0으로 변환
+    import numpy as _np_diag
+    _np_diag.fill_diagonal(data["fc_target"], 0.0)
+    print("[DATA] fc_target diagonal → 0")
 
     # Network build + warmup (Cell 9)
     print("\n[0] Building network + warmup...")
