@@ -170,7 +170,7 @@ _DATASET_PARAMS = {
         sc_csv="weight_nor.csv",
         length_csv="tract_length_nor.csv",
         fc_csv="FC_nor.csv",
-        region_txt="Custom_Schaefer400_PD25subcortex_1mm.txt",
+        region_txt="Atlas_43.txt",
         tract_conduction_speed=3.0,
         additive_noise_sigma=0.02,
     ),
@@ -185,6 +185,10 @@ def make_config(dataset: str) -> Config:
         sc_csv                              = p["sc_csv"],
         length_csv                          = p["length_csv"],
         fc_csv                              = p["fc_csv"],
+
+        # ── 캐시 (노트북 Cell 5와 동일: 기존 캐시 재사용) ────────
+        cache_version                       = f"v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_{dataset}",
+        cache_root_dir                      = f"./cache/cache/{dataset}",
 
         # ── 시뮬레이션 공통 ──────────────────────────────────────
         integration_dt_ms                   = 1.0,
