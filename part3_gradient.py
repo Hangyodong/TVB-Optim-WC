@@ -87,11 +87,28 @@ def run_gradient_optimization(
     cfg: Config = None,
     data: dict = None,
     warmup_result=None,
+    warmup_bundle: StateBundle = None,  # Patch 26: step-0 warmup start
 ) -> StateBundle:
     """
     Full-matrix gradient 최적화를 실행하고 구버전 notebook 로직처럼 raw optimized StateBundle을 반환한다.
     """
     bundle_eib = _coerce_gradient_bundle(bundle_in, eib_results, cfg, data, stage="eib")
+
+    # Patch 26: optimize from warmup state (step 0) + EIB-tuned params,
+    # consistent with EIB post-hoc validation.
+    if warmup_bundle is not None:
+        bundle_start = warmup_bundle.advance(
+            new_params=bundle_eib.params,
+            new_init_dynamics=warmup_bundle.init_dynamics,
+            new_bold_history=warmup_bundle.bold_history,
+            new_bold_window=warmup_bundle.bold_window,
+            new_internal_state=warmup_bundle.internal_state,
+            new_delay_history=warmup_bundle.delay_history,
+            next_stage="grad_warmup_start",
+            metadata_update={},
+        )
+    else:
+        bundle_start = bundle_eib
 
     cache_name = (
         f"grad_{data['cache_tag']}"
@@ -99,13 +116,13 @@ def run_gradient_optimization(
         f"_SKIP{cfg.optimizer_bold_skip_tr}"
         f"_STEPS{cfg.optimizer_max_steps}"
         f"_LR{str(cfg.optimizer_learning_rate).replace('.', 'p')}"
-        f"_frozen{int(bundle_eib.params.c_ei_frozen)}"
-        f"_fp{bundle_eib.fingerprint()}"
+        f"_frozen{int(bundle_start.params.c_ei_frozen)}"
+        f"_fp{bundle_start.fingerprint()}"
     )
 
     @cache(cache_name, redo=False)
     def _cached_run():
-        return _run_full_gradient_pure(network, bundle_eib.to_dict(), cfg, data)
+        return _run_full_gradient_pure(network, bundle_start.to_dict(), cfg, data)
 
     result = _cached_run()
     bundle_grad = StateBundle.from_dict(result["bundle"])
@@ -149,13 +166,17 @@ def _run_full_gradient_pure(
     bold_monitor_opt = bundle_in.build_bold_monitor(cfg)
     fc_target_safe = jnp.asarray(np.nan_to_num(data["fc_target"], nan=0.0))
 
-    pre_opt_fc = compute_simulated_fc(
-        network,
-        bundle_in,
-        cfg,
-        sim_duration_ms=t1_opt,
-        skip_tr=cfg.optimizer_bold_skip_tr,
-    )
+    # Stage handoff: pre-opt FC = predecessor (EIB) stored post-FC for exact
+    # plot continuity; fall back to a fresh sim if the bundle lacks it.
+    pre_opt_fc = bundle_in.metadata.get("post_eib_fc_matrix", None)
+    if pre_opt_fc is None:
+        pre_opt_fc = compute_simulated_fc(
+            network,
+            bundle_in,
+            cfg,
+            sim_duration_ms=t1_opt,
+            skip_tr=cfg.optimizer_bold_skip_tr,
+        )
 
     def compute_loss(state):
         sim = compiled_model(state)
@@ -244,6 +265,13 @@ def _run_full_gradient_pure(
         skip_tr=cfg.optimizer_bold_skip_tr,
     )
 
+    # Stage handoff: stamp post-grad FC so low-rank reads it as pre-opt FC.
+    candidate_bundle = candidate_bundle.with_metadata({
+        "post_grad_fc_matrix": np.asarray(post_opt_fc, dtype=np.float32),
+        "post_grad_fc_corr": float(fc_corr(jnp.asarray(post_opt_fc), fc_target_safe)),
+        "post_grad_fc_rmse": _compute_rmse_metric(post_opt_fc, data["fc_target"]),
+    })
+
     return {
         "bundle": candidate_bundle.to_dict(),
         "loss_history": np.asarray(loss_history, dtype=np.float32),
@@ -273,11 +301,27 @@ def run_lowrank_optimization(
     cfg: Config = None,
     data: dict = None,
     warmup_result=None,
+    warmup_bundle: StateBundle = None,  # Patch 26: step-0 warmup start
 ) -> StateBundle:
     """
     Low-rank correction 최적화를 실행하고 Full Gradient 결과 위에서 바로 StateBundle을 반환한다.
     """
     bundle_grad = _coerce_lowrank_bundle(bundle_in, optimized_state, eib_results, cfg, data)
+
+    # Patch 26: optimize from warmup state (step 0) + gradient-tuned params.
+    if warmup_bundle is not None:
+        bundle_start = warmup_bundle.advance(
+            new_params=bundle_grad.params,
+            new_init_dynamics=warmup_bundle.init_dynamics,
+            new_bold_history=warmup_bundle.bold_history,
+            new_bold_window=warmup_bundle.bold_window,
+            new_internal_state=warmup_bundle.internal_state,
+            new_delay_history=warmup_bundle.delay_history,
+            next_stage="lowrank_warmup_start",
+            metadata_update={},
+        )
+    else:
+        bundle_start = bundle_grad
 
     cache_name = (
         f"grad_lowrank_{data['cache_tag']}"
@@ -286,12 +330,12 @@ def run_lowrank_optimization(
         f"_STEPS{cfg.lowrank_max_steps}"
         f"_LR{str(cfg.lowrank_learning_rate).replace('.', 'p')}"
         f"_ds{str(cfg.lowrank_delta_scale).replace('.', 'p')}"
-        f"_fp{bundle_grad.fingerprint()}"
+        f"_fp{bundle_start.fingerprint()}"
     )
 
     @cache(cache_name, redo=False)
     def _cached_run():
-        return _run_lowrank_pure(network, bundle_grad.to_dict(), cfg, data)
+        return _run_lowrank_pure(network, bundle_start.to_dict(), cfg, data)
 
     result = _cached_run()
     bundle_lowrank = StateBundle.from_dict(result["bundle"])
@@ -349,13 +393,17 @@ def _run_lowrank_pure(
         ffi_v=jnp.asarray(key.normal(size=(n_nodes, rank)).astype(np.float32) * fi),
     )
 
-    pre_opt_fc = compute_simulated_fc(
-        network,
-        bundle_in,
-        cfg,
-        sim_duration_ms=t1_lr,
-        skip_tr=cfg.lowrank_bold_skip_tr,
-    )
+    # Stage handoff: pre-opt FC = predecessor (gradient) stored post-FC for
+    # exact plot continuity; fall back to a fresh sim if the bundle lacks it.
+    pre_opt_fc = bundle_in.metadata.get("post_grad_fc_matrix", None)
+    if pre_opt_fc is None:
+        pre_opt_fc = compute_simulated_fc(
+            network,
+            bundle_in,
+            cfg,
+            sim_duration_ms=t1_lr,
+            skip_tr=cfg.lowrank_bold_skip_tr,
+        )
 
     def _reconstruct_weights(trainable: LowRankTrainable):
         delta_lre = delta_scale * (trainable.lre_u @ trainable.lre_v.T)

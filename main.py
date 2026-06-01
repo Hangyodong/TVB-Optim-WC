@@ -376,10 +376,11 @@ def main():
     if not args.skip_gradient:
         print("\n[3] Running Gradient Optimization...")
         bundle_grad = run_gradient_optimization(
-            network   = network,
-            bundle_in = bundle_eib,
-            cfg       = cfg,
-            data      = data,
+            network       = network,
+            bundle_in     = bundle_eib,
+            warmup_bundle = bundle_init,
+            cfg           = cfg,
+            data          = data,
         )
         print(f"[Part3] stage={bundle_grad.stage}  c_ei_frozen={bundle_grad.params.c_ei_frozen}")
         print(bundle_grad)
@@ -391,10 +392,11 @@ def main():
     if not args.skip_lowrank:
         print("\n[3B] Running LowRank Optimization...")
         bundle_lowrank = run_lowrank_optimization(
-            network   = network,
-            bundle_in = bundle_grad,
-            cfg       = cfg,
-            data      = data,
+            network       = network,
+            bundle_in     = bundle_grad,
+            warmup_bundle = bundle_init,
+            cfg           = cfg,
+            data          = data,
         )
         print(f"[Part3B] stage={bundle_lowrank.stage}  c_ei_frozen={bundle_lowrank.params.c_ei_frozen}")
         print(bundle_lowrank)
