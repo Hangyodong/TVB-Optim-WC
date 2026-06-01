@@ -16,7 +16,6 @@ import numpy as np
 
 from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
 from tvboptim.observations.observation import fc_corr, rmse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tvboptim.utils import cache
 
 from config import Config
@@ -63,7 +62,6 @@ def run_eib(
         f"_etaF{str(cfg.eib_internal_fic_learning_rate).replace('.', 'p')}"
         f"_etaE{str(cfg.eib_max_weight_learning_rate).replace('.', 'p')}"
         f"_steps{cfg.eib_max_iterations}"
-        f"_topk{cfg.eib_posthoc_top_k}"
         f"_frozen{int(bundle_fic.params.c_ei_frozen)}"
         f"_fp{bundle_fic.fingerprint()}"
     )
@@ -288,6 +286,14 @@ def _run_eib_loop_pure(
     post_eib_corr = float(posthoc_fc_corr(posthoc_fc, data["fc_target"]))
     post_eib_rmse = float(np.sqrt(np.mean((np.asarray(posthoc_fc, dtype=np.float32) - np.asarray(data["fc_target"], dtype=np.float32)) ** 2)))
 
+    # Stage handoff: stamp post-hoc FC into the bundle so Part 3 reads it as
+    # pre-opt FC (exact continuity), mirroring Part 1's post_fic_fc_matrix.
+    best_bundle = best_bundle.with_metadata({
+        "post_eib_fc_matrix": np.asarray(posthoc_fc, dtype=np.float32),
+        "post_eib_fc_corr": float(post_eib_corr),
+        "post_eib_fc_rmse": float(post_eib_rmse),
+    })
+
     return {
         "bundle": best_bundle.to_dict(),
         "fc_correlations": np.asarray(fc_correlation_history or [np.nan], dtype=np.float32),
@@ -329,114 +335,59 @@ def _run_posthoc_validation(
             0,
         )
 
-    top_k = min(cfg.eib_posthoc_top_k, len(snapshot_bundle_dicts))
-    top_idx = np.argsort(np.asarray(snapshot_window_corrs))[::-1][:top_k]
-
-    # === Patch 3: optional parallel post-hoc validation (toggle) ===
-    if getattr(cfg, 'posthoc_parallel', False):
-        print(
-            f"\n[EIB] 2단계 Post-hoc Validation (PARALLEL path): "
-            f"상위 {top_k}개 × {cfg.eib_posthoc_duration_ms//1000}분 시뮬"
-        )
-        best_eval_p, best_iter_p = _run_posthoc_validation_parallel(
-            network=network,
-            snapshot_bundle_dicts=snapshot_bundle_dicts,
-            snapshot_iterations=snapshot_iterations,
-            snapshot_window_corrs=snapshot_window_corrs,
-            top_idx=top_idx,
-            fc_target=fc_target,
-            cfg=cfg,
-            data=data,
-        )
-        if best_eval_p is None:
-            print("[EIB] parallel path: 후보 실패 → window best settle 사용")
-            fallback_eval = _evaluate_candidate_bundle(
-                network, fallback_bundle, cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr, cfg, data
-            )
-            return (fallback_eval["bundle"], fallback_eval["fc_matrix"],
-                    fallback_eval["neural_data"], 0)
-        print(
-            f"[EIB] (parallel) Final best @ iter {best_iter_p}"
-            f"  true_corr={posthoc_fc_corr(best_eval_p['fc_matrix'], fc_target):.4f}"
-        )
-        return (best_eval_p["bundle"], best_eval_p["fc_matrix"],
-                best_eval_p["neural_data"], best_iter_p)
+    # Patch 30: always select the single snapshot with highest window_corr,
+    # run exactly 1 resimulation (warmup state + that snapshot's params).
+    best_snap_idx = int(np.argmax(np.asarray(snapshot_window_corrs)))
+    best_iteration = int(snapshot_iterations[best_snap_idx])
 
     print(
         f"\n[EIB] 2단계 Post-hoc Validation: "
-        f"상위 {top_k}개 × {cfg.eib_posthoc_duration_ms//1000}분 시뮬"
+        f"window best 1개 × {cfg.eib_posthoc_duration_ms//1000}분 시뮬"
     )
-    print(f"  {'Rank':>5} {'Iter':>6} {'Win-corr':>10} {'True-corr':>10} {'True-RMSE':>10}")
-    print("  " + "-" * 46)
+    print(f"  {'Iter':>6} {'Win-corr':>10} {'True-corr':>10} {'True-RMSE':>10}")
+    print("  " + "-" * 40)
 
-    best_score = -np.inf
-    best_eval = None
-    best_iteration = 0
     start_time = time.time()
 
-    # === Patch 4 Fix 1: parallel post-hoc validation ===
-    def _eval_one(args):
-        _rank, _snap_idx = args
-        # Patch 25: post-hoc from warmup state (step 0) + snapshot params.
-        # Same principle as eval_fc() in the original EI_Tuning notebook.
-        _snap_bundle = StateBundle.from_dict(snapshot_bundle_dicts[_snap_idx])
-        if warmup_bundle is not None:
-            _cb = warmup_bundle.advance(
-                new_params=_snap_bundle.params,
-                new_init_dynamics=warmup_bundle.init_dynamics,
-                new_bold_history=warmup_bundle.bold_history,
-                new_bold_window=warmup_bundle.bold_window,
-                new_internal_state=warmup_bundle.internal_state,
-                new_delay_history=warmup_bundle.delay_history,
-                next_stage="posthoc_warmup",
-                metadata_update={},
-            )
-        else:
-            _cb = _snap_bundle
-        return _rank, _snap_idx, _evaluate_candidate_bundle(
-            network, _cb,
-            cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr,
-            cfg, data,
+    # Patch 25: post-hoc from warmup state (step 0) + snapshot params.
+    # Same principle as eval_fc() in the original EI_Tuning notebook.
+    _snap_bundle = StateBundle.from_dict(snapshot_bundle_dicts[best_snap_idx])
+    if warmup_bundle is not None:
+        candidate_bundle = warmup_bundle.advance(
+            new_params=_snap_bundle.params,
+            new_init_dynamics=warmup_bundle.init_dynamics,
+            new_bold_history=warmup_bundle.bold_history,
+            new_bold_window=warmup_bundle.bold_window,
+            new_internal_state=warmup_bundle.internal_state,
+            new_delay_history=warmup_bundle.delay_history,
+            next_stage="posthoc_warmup",
+            metadata_update={},
         )
+    else:
+        candidate_bundle = _snap_bundle
 
-    n_workers = min(top_k, 4)
-    print(f"  [parallel] {top_k}개 후보를 {n_workers} workers로 동시 실행 중...")
-    _parallel_results = {}
-    with ThreadPoolExecutor(max_workers=n_workers) as _executor:
-        _futures = {
-            _executor.submit(_eval_one, (rank, snap_idx)): rank
-            for rank, snap_idx in enumerate(top_idx)
-        }
-        for _future in as_completed(_futures):
-            _rank, _snap_idx, _candidate_eval = _future.result()
-            _parallel_results[_rank] = (_snap_idx, _candidate_eval)
+    best_eval = _evaluate_candidate_bundle(
+        network, candidate_bundle,
+        cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr,
+        cfg, data,
+    )
 
-    for rank in sorted(_parallel_results):
-        snap_idx, candidate_eval = _parallel_results[rank]
-        true_fc = candidate_eval["fc_matrix"]
+    true_fc = best_eval["fc_matrix"]
+    true_full_corr = float(fc_corr(jnp.asarray(true_fc), jnp.asarray(fc_target)))
+    true_full_rmse = float(jnp.sqrt(jnp.mean((true_fc - fc_target) ** 2)))
 
-        true_full_corr = float(fc_corr(jnp.asarray(true_fc), jnp.asarray(fc_target)))
-        true_full_rmse = float(jnp.sqrt(jnp.mean((true_fc - fc_target) ** 2)))
-        full_term = cfg.correlation_loss_weight * (1 - true_full_corr) + cfg.rmse_loss_weight * true_full_rmse
-        true_score = -(cfg.full_brain_fc_loss_weight * full_term)
-
-        print(
-            f"  {rank+1:>5} {snapshot_iterations[snap_idx]:>6}"
-            f"  {snapshot_window_corrs[snap_idx]:>10.4f}"
-            f"  {true_full_corr:>10.4f}"
-            f"  {true_full_rmse:>10.4f}"
-        )
-
-        if np.isfinite(true_score) and true_score > best_score:
-            best_score = true_score
-            best_eval = candidate_eval
-            best_iteration = int(snapshot_iterations[snap_idx])
+    print(
+        f"  {best_iteration:>6}"
+        f"  {snapshot_window_corrs[best_snap_idx]:>10.4f}"
+        f"  {true_full_corr:>10.4f}"
+        f"  {true_full_rmse:>10.4f}"
+    )
 
     elapsed = time.time() - start_time
     print(f"\n[EIB] 2단계 완료 — {_fmt_time(elapsed)}")
 
-    if best_eval is None:
-        print("[EIB] 모든 후보가 실패 → window best settle 사용")
+    if not np.isfinite(true_full_corr):
+        print("[EIB] 후보 실패 → window best settle 사용")
         fallback_eval = _evaluate_candidate_bundle(
             network, fallback_bundle, cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr, cfg, data
         )
@@ -604,40 +555,6 @@ def _fmt_time(secs: float) -> str:
 
 
 # === Patch 3: parallel post-hoc validation helper ===
-def _run_posthoc_validation_parallel(
-    network,
-    snapshot_bundle_dicts,
-    snapshot_iterations,
-    snapshot_window_corrs,
-    top_idx,
-    fc_target,
-    cfg,
-    data,
-):
-    """
-    JIT cache 재사용 + Python overhead 최소화로 sequential 대비 ~20-30% 단축.
-    진정한 device-batched vmap은 model.py 재설계가 필요하므로 별도 patch로 분리.
-    결과는 sequential 경로와 numerical하게 동등 (호출 순서/타이밍만 다름).
-    """
-    import time as _t
-    fc_target_j = jnp.asarray(fc_target)
-    fc_target_np = np.asarray(fc_target, dtype=np.float32)
-
-    print(f"  {'Rank':>5} {'Iter':>6} {'Win-corr':>10} {'True-corr':>10} {'True-RMSE':>10}")
-    print("  " + "-" * 46)
-
-    best_score = -np.inf
-    best_eval = None
-    best_iteration = 0
-    t0 = _t.time()
-
-    # 1차: 모든 candidate에 대해 시뮬을 연속 호출. JIT cache는 첫 호출 이후 재사용된다.
-    candidate_evals = []
-
-    print(f"\n[EIB] 2단계 (parallel path) 완료 — {_fmt_time(_t.time() - t0)}")
-    return best_eval, best_iteration
-
-
 def posthoc_fc_corr(fc_matrix: np.ndarray, fc_target: np.ndarray) -> float:
     return float(fc_corr(jnp.asarray(fc_matrix), jnp.asarray(fc_target)))
 

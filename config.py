@@ -94,7 +94,6 @@ class Config:
     eib_snapshot_save_interval:     int   = 50
     connectivity_weight_max:        float = 1.5
 
-    eib_posthoc_top_k:              int   = 10
     eib_posthoc_duration_ms:        int   = 720_000
     eib_posthoc_skip_tr:            int   = 20
 

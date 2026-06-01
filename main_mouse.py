@@ -209,7 +209,6 @@ def make_config(dataset: str) -> Config:
         eib_bold_window_samples             = 720,
         eib_snapshot_save_interval          = 50,
         connectivity_weight_max             = 1.5,
-        eib_posthoc_top_k                   = 10,
         eib_posthoc_duration_ms             = 720_000,
         eib_posthoc_skip_tr                 = 60,
 
