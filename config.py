@@ -25,7 +25,7 @@ class Config:
     fc_csv:         str = "FC_compact.csv"
     cache_root_dir: str = "./cache"
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25"
 
     # ── Wilson-Cowan model parameters (Patch 15) ──────────────
     # dataset="human": SanzLeonet 2014 / dataset="mouse": current
@@ -93,9 +93,6 @@ class Config:
     eib_bold_window_samples:        int   = 150
     eib_snapshot_save_interval:     int   = 50
     connectivity_weight_max:        float = 1.5
-    # === Patch 19: EIB State Rotation Augmentation ===
-    eib_n_augment_seeds  : int   = 1     # 1=기존, >1=state rotation
-    eib_augment_interval : int   = 500   # N step마다 초기 상태 교체
 
     eib_posthoc_top_k:              int   = 10
     eib_posthoc_duration_ms:        int   = 300_000
