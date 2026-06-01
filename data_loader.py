@@ -146,8 +146,47 @@ def _resolve_path(preferred: str, fallback: str) -> str:
 
 
 def _load_region_labels(region_txt_path: str) -> list:
-    with open(region_txt_path, "r", encoding="utf-8") as file_handle:
-        return [line.strip() for line in file_handle if line.strip()]
+    """Load region labels supporting three formats:
+    1. Plain:       one label per line
+    2. TSV:         tab-separated with header containing "name" column
+    3. Index+space: "<int> <label_name>" (e.g. Schaefer/Atlas style)
+    encoding="utf-8-sig" strips any leading BOM.
+    """
+    labels = []
+    with open(region_txt_path, "r", encoding="utf-8-sig") as fh:
+        lines = [l.strip() for l in fh if l.strip()]
+    if not lines:
+        return labels
+    first = lines[0]
+    # Format 2: TSV with header containing "name" column
+    if "\t" in first and "name" in first.lower():
+        cols = first.split("\t")
+        try:
+            name_idx = cols.index("name")
+        except ValueError:
+            name_idx = -1
+        for line in lines[1:]:
+            parts = line.split("\t")
+            if name_idx >= 0 and name_idx < len(parts):
+                labels.append(parts[name_idx].strip())
+            else:
+                labels.append(line)
+    # Format 3: "<int> <label>" space-separated
+    elif " " in first:
+        parts0 = first.split(None, 1)
+        if len(parts0) == 2 and parts0[0].isdigit():
+            for line in lines:
+                p2 = line.split(None, 1)
+                if len(p2) == 2 and p2[0].isdigit():
+                    labels.append(p2[1].strip())
+                elif p2:
+                    labels.append(p2[-1].strip())
+        else:
+            labels = list(lines)
+    # Format 1: plain labels
+    else:
+        labels = list(lines)
+    return labels
 
 
 def _load_matrices(sc_path: str, length_path: str, fc_path: str) -> tuple:
