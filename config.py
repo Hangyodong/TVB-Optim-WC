@@ -25,7 +25,7 @@ class Config:
     fc_csv:         str = "FC_compact.csv"
     cache_root_dir: str = "./cache"
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21"
 
     # ── Wilson-Cowan model parameters (Patch 15) ──────────────
     # dataset="human": SanzLeonet 2014 / dataset="mouse": current
@@ -68,7 +68,7 @@ class Config:
     bold_hrf_tau_s       : float = 0.8        # seconds
     bold_hrf_tau_f       : float = 0.4        # seconds
     bold_hrf_scaling     : float = 1.0 / 3.0
-    bold_hrf_duration_ms : float = 32_000.0   # ms (32s for mouse)
+    bold_hrf_duration_ms : float = 20_000.0   # ms (20s default; mouse uses 32s)
     tract_conduction_speed:  float = 3.0
     additive_noise_sigma:    float = 0.01
     bundle_rng_seed:         int   = 42

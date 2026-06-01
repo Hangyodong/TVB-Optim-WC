@@ -325,7 +325,7 @@ class StateBundle:
             tau_s    = getattr(cfg, "bold_hrf_tau_s",    0.8),
             tau_f    = getattr(cfg, "bold_hrf_tau_f",    0.4),
             scaling  = getattr(cfg, "bold_hrf_scaling",  1.0 / 3.0),
-            duration = getattr(cfg, "bold_hrf_duration_ms", 32_000.0),
+            duration = getattr(cfg, "bold_hrf_duration_ms", 20_000.0),
         )
         monitor = Bold(
             period=cfg.bold_repetition_time_ms,

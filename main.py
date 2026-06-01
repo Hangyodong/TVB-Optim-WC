@@ -117,10 +117,17 @@ _DATASET_PARAMS = {
         wc_rE_max_hz=20.0, wc_rI_max_hz=20.0,
         wc_c_ei_init=6.0,
         fic_target_firing_rate_hz=4.0,
+        # Bold HRF: library defaults for human
+        bold_hrf_k1=5.6,
+        bold_hrf_V0=0.02,
+        bold_hrf_tau_s=0.8,
+        bold_hrf_tau_f=0.4,
+        bold_hrf_scaling=1.0 / 3.0,
+        bold_hrf_duration_ms=20_000.0,  # 20s (library default)
         sc_csv="weight.csv",
         length_csv="tract_length.csv",
         fc_csv="fc_matrix.csv",
-        region_txt="Custom_Schaefer400_PD25subcortex_1mm.mni.txt",
+        region_txt="Custom_Schaefer400_PD25subcortex_1mm.txt",
         tract_conduction_speed=1.0,
         additive_noise_sigma=0.01,
     ),
@@ -139,10 +146,17 @@ _DATASET_PARAMS = {
         wc_rE_max_hz=20.0, wc_rI_max_hz=20.0,
         wc_c_ei_init=10.0,
         fic_target_firing_rate_hz=2.0,
+        # Bold HRF: mouse-specific
+        bold_hrf_k1=5.6,
+        bold_hrf_V0=0.02,
+        bold_hrf_tau_s=0.8,
+        bold_hrf_tau_f=0.4,
+        bold_hrf_scaling=1.0 / 3.0,
+        bold_hrf_duration_ms=32_000.0,  # 32s (mouse-specific)
         sc_csv="weight_nor.csv",
         length_csv="tract_length_nor.csv",
         fc_csv="FC_nor.csv",
-        region_txt="Custom_Schaefer400_PD25subcortex_1mm.mni.txt",
+        region_txt="Custom_Schaefer400_PD25subcortex_1mm.txt",
         tract_conduction_speed=3.0,
         additive_noise_sigma=0.02,
     ),
@@ -256,6 +270,14 @@ def make_config(dataset: str) -> Config:
         wc_rE_max_hz = p["wc_rE_max_hz"],
         wc_rI_max_hz = p["wc_rI_max_hz"],
         wc_c_ei_init = p["wc_c_ei_init"],
+
+        # ── Bold HRF (dataset별 자동 설정, Patch 21) ───────────
+        bold_hrf_k1          = p["bold_hrf_k1"],
+        bold_hrf_V0          = p["bold_hrf_V0"],
+        bold_hrf_tau_s       = p["bold_hrf_tau_s"],
+        bold_hrf_tau_f       = p["bold_hrf_tau_f"],
+        bold_hrf_scaling     = p["bold_hrf_scaling"],
+        bold_hrf_duration_ms = p["bold_hrf_duration_ms"],
     )
 
 # ── 5. 메인 실행 ─────────────────────────────────────────────────────────
