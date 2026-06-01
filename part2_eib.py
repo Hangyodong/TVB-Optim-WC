@@ -83,6 +83,100 @@ def run_eib(
 
 # ── EIB 탐색 + post-hoc validation ───────────────────────────
 
+
+# === Patch 19: EIB Augmentation helpers ===========================
+
+def _generate_augment_states(
+    network,
+    bundle_in: "StateBundle",
+    cfg: "Config",
+    n_seeds: int,
+) -> list:
+    """
+    bundle_in에서 출발해 짧은 시뮬(1 TR × 200 step)을 n_seeds번 실행.
+    각각 다른 JAX dispatch 순서를 갖게 되므로 서로 다른 trajectory.
+    (noise sigma > 0이면 자연스럽게 diverge)
+
+    Returns: list of StateBundle (length = n_seeds)
+    """
+    from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
+    import time as _t
+
+    solver = BoundedSolver(Heun(), low=0.0, high=1.0)
+    states = [bundle_in]  # seed 0 = 원본
+
+    for seed_i in range(1, n_seeds):
+        # bundle_in에서 출발해 200 TR 시뮬 → 다른 상태
+        spin_steps = 200
+        update_fn, state = bundle_in.to_tvb_state(
+            network, solver,
+            t1=int(cfg.bold_repetition_time_ms),
+            dt=cfg.integration_dt_ms,
+        )
+        bold_mon = bundle_in.build_bold_monitor(cfg)
+        metadata = dict(bundle_in.metadata)
+
+        for _ in range(spin_steps):
+            result = update_fn(state)
+            bold_mon = update_bold_history(bold_mon, result)
+            state.initial_state.dynamics = result.data[-1]
+            _internal_state, metadata = advance_internal_state(state, metadata)
+
+        from pipeline_contracts import capture_internal_state
+        new_bundle = bundle_in.advance(
+            new_params=bundle_in.params,
+            new_init_dynamics=np.asarray(state.initial_state.dynamics, dtype=np.float32),
+            new_bold_history=np.asarray(bold_mon.history, dtype=np.float32),
+            new_bold_window=bundle_in.bold_window,
+            new_internal_state=capture_internal_state(state),
+            new_delay_history=bundle_in.delay_history,
+            next_stage="eib_augment_seed",
+            metadata_update=metadata,
+        )
+        states.append(new_bundle)
+        print(f"  [augment] seed {seed_i}/{n_seeds-1} 생성 완료")
+
+    return states
+
+
+def _reset_eib_state_to_bundle(
+    network,
+    target_bundle: "StateBundle",
+    current_params: "ParamSet",
+    cfg: "Config",
+    n_nodes: int,
+):
+    """
+    target_bundle의 initial state/bold_history로 시뮬 상태를 교체하되
+    학습된 wLRE/wFFI/c_ei (current_params)는 유지한다.
+
+    Returns: (update_model, tuned_state, tuned_bold_monitor, bold_rolling_buffer)
+    """
+    from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
+    import jax.numpy as jnp
+
+    solver = BoundedSolver(Heun(), low=0.0, high=1.0)
+
+    update_model, tuned_state = target_bundle.to_tvb_state(
+        network, solver,
+        t1=int(cfg.bold_repetition_time_ms),
+        dt=cfg.integration_dt_ms,
+    )
+    tuned_bold_monitor = target_bundle.build_bold_monitor(cfg)
+
+    # 학습된 파라미터를 새 상태에 이식
+    tuned_state.dynamics.c_ei = jnp.asarray(current_params.c_ei)
+    tuned_state.coupling.coupling.wLRE = jnp.asarray(current_params.wLRE)
+    tuned_state.coupling.coupling.wFFI = jnp.asarray(current_params.wFFI)
+
+    # BOLD rolling buffer 초기화 (새 trajectory 시작)
+    bold_rolling_buffer = jnp.zeros(
+        (cfg.eib_bold_window_samples, 1, n_nodes), dtype=jnp.float32
+    )
+
+    return update_model, tuned_state, tuned_bold_monitor, bold_rolling_buffer
+
+
 def _run_eib_loop_pure(
     network,
     init_dict: dict,
@@ -111,6 +205,19 @@ def _run_eib_loop_pure(
     bold_rolling_buffer = jnp.asarray(
         bundle_in.get_fc_seed_window(cfg.eib_bold_window_samples, n_nodes)
     ).reshape((cfg.eib_bold_window_samples, 1, n_nodes))
+
+    # === Patch 19: augment states 생성 ===
+    _n_aug = getattr(cfg, "eib_n_augment_seeds", 1)
+    _aug_interval = getattr(cfg, "eib_augment_interval", 500)
+    _aug_seed_idx = 0
+    if _n_aug > 1:
+        print(f"[EIB] Patch 19: {_n_aug}개 augment states 생성 중...")
+        _augment_states = _generate_augment_states(
+            network, bundle_in, cfg, _n_aug
+        )
+        print(f"[EIB] augment states 준비 완료")
+    else:
+        _augment_states = [bundle_in]
 
     rE_max = float(WilsonCowanEIB.DEFAULT_PARAMS.rE_max_hz)
     rI_max = float(WilsonCowanEIB.DEFAULT_PARAMS.rI_max_hz)
@@ -155,6 +262,24 @@ def _run_eib_loop_pure(
     window_best_corr = np.nan
 
     for step_index in range(cfg.eib_max_iterations):
+        # === Patch 19: periodic state rotation ===
+        if _n_aug > 1 and step_index > 0 and step_index % _aug_interval == 0:
+            _aug_seed_idx = (_aug_seed_idx + 1) % _n_aug
+            _cur_params = ParamSet(
+                c_ei=np.asarray(tuned_state.dynamics.c_ei, dtype=np.float32),
+                wLRE=np.asarray(tuned_state.coupling.coupling.wLRE, dtype=np.float32),
+                wFFI=np.asarray(tuned_state.coupling.coupling.wFFI, dtype=np.float32),
+                c_ei_frozen=bundle_in.params.c_ei_frozen,
+            )
+            update_model, tuned_state, tuned_bold_monitor, bold_rolling_buffer = \
+                _reset_eib_state_to_bundle(
+                    network, _augment_states[_aug_seed_idx],
+                    _cur_params, cfg, n_nodes
+                )
+            print(
+                f"  [aug] step {step_index}: seed {_aug_seed_idx} 로 state 교체"
+            )
+
         step_result = update_model(tuned_state)
         raw_arr = np.asarray(step_result.data)
 
@@ -371,15 +496,50 @@ def _run_posthoc_validation(
     best_iteration = 0
     start_time = time.time()
 
+    # === Patch 19: multi-seed post-hoc validation ===
+    _n_aug_ph = getattr(cfg, "eib_n_augment_seeds", 1)
+    if _n_aug_ph > 1 and "_augment_states" in dir():
+        _ph_seeds = _augment_states
+    else:
+        _ph_seeds = [bundle_in]
+
     # === Patch 4 Fix 1: parallel post-hoc validation ===
     def _eval_one(args):
         _rank, _snap_idx = args
-        _cb = StateBundle.from_dict(snapshot_bundle_dicts[_snap_idx])
-        return _rank, _snap_idx, _evaluate_candidate_bundle(
-            network, _cb,
-            cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr,
-            cfg, data,
-        )
+        _cb_base = StateBundle.from_dict(snapshot_bundle_dicts[_snap_idx])
+        if _n_aug_ph > 1:
+            # multi-seed: 각 seed bundle에 snapshot 파라미터 이식 후 평균
+            _results = []
+            for _seed_bundle in _ph_seeds:
+                _cb_s = _seed_bundle.advance(
+                    new_params=_cb_base.params,
+                    new_init_dynamics=_seed_bundle.init_dynamics,
+                    new_bold_history=_seed_bundle.bold_history,
+                    new_bold_window=_seed_bundle.bold_window,
+                    new_internal_state=_seed_bundle.internal_state,
+                    new_delay_history=_seed_bundle.delay_history,
+                    next_stage="posthoc_multiseed",
+                    metadata_update={},
+                )
+                _r = _evaluate_candidate_bundle(
+                    network, _cb_s,
+                    cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr,
+                    cfg, data,
+                )
+                _results.append(_r)
+            # 평균 FC로 best 선택
+            import numpy as _nps
+            _avg_fc = _nps.mean([_nps.asarray(r["fc_matrix"]) for r in _results], axis=0)
+            _best_r = _results[0]
+            _best_r["fc_matrix"] = _avg_fc
+            return _rank, _snap_idx, _best_r
+        else:
+            _cb = _cb_base
+            return _rank, _snap_idx, _evaluate_candidate_bundle(
+                network, _cb,
+                cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr,
+                cfg, data,
+            )
 
     n_workers = min(top_k, 4)
     print(f"  [parallel] {top_k}개 후보를 {n_workers} workers로 동시 실행 중...")
@@ -565,7 +725,7 @@ def _eib_update_rule(
 
 def _clip_sym(w, sc_mask: np.ndarray, w_max: float):
     w = jnp.where(jnp.isfinite(w), w, 0.0)
-    w = jnp.clip(w, 0.0, w_max) * jnp.asarray(sc_mask)
+    w = jnp.clip(w, 0.0, None) * jnp.asarray(sc_mask)  # Patch: 상한 제거
     return 0.5 * (w + w.T)
 
 

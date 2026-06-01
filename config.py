@@ -25,7 +25,36 @@ class Config:
     fc_csv:         str = "FC_compact.csv"
     cache_root_dir: str = "./cache"
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19"
+
+    # ── Wilson-Cowan model parameters (Patch 15) ──────────────
+    # dataset="human": SanzLeonet 2014 / dataset="mouse": current
+    wc_c_ee      : float = 11.0    # mouse default
+    wc_c_ei      : float = 10.0
+    wc_c_ie      : float = 10.0
+    wc_c_ii      : float = 1.0
+    wc_r_e       : float = 1.0
+    wc_r_i       : float = 1.0
+    wc_tau_e     : float = 10.0
+    wc_tau_i     : float = 10.0
+    wc_alpha_e   : float = 1.2
+    wc_alpha_i   : float = 2.0
+    wc_theta_e   : float = 2.0
+    wc_theta_i   : float = 3.5
+    wc_k_e       : float = 1.0
+    wc_k_i       : float = 1.0
+    wc_a_e       : float = 1.0
+    wc_a_i       : float = 1.0
+    wc_b_e       : float = 0.0
+    wc_b_i       : float = 0.0
+    wc_c_e       : float = 1.0
+    wc_c_i       : float = 1.0
+    wc_P         : float = 0.5
+    wc_Q         : float = 0.0
+    wc_lamda     : float = 1.0
+    wc_rE_max_hz : float = 20.0
+    wc_rI_max_hz : float = 20.0
+    wc_c_ei_init : float = 10.0   # FIC 초기값
 
     # ── 시뮬레이션 공통 ──────────────────────────────────────
     integration_dt_ms:       float = 1.0
@@ -64,6 +93,10 @@ class Config:
     eib_bold_window_samples:        int   = 150
     eib_snapshot_save_interval:     int   = 50
     connectivity_weight_max:        float = 1.5
+    # === Patch 19: EIB State Rotation Augmentation ===
+    eib_n_augment_seeds  : int   = 1     # 1=기존, >1=state rotation
+    eib_augment_interval : int   = 500   # N step마다 초기 상태 교체
+
     eib_posthoc_top_k:              int   = 10
     eib_posthoc_duration_ms:        int   = 300_000
     eib_posthoc_skip_tr:            int   = 20
