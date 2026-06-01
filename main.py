@@ -211,6 +211,7 @@ def make_config(dataset: str) -> Config:
         eib_internal_fic_learning_rate      = 0.05,
         eib_max_weight_learning_rate        = 0.002,
         eib_bold_window_samples             = 720,
+        eib_update_interval                 = 1,
         eib_snapshot_save_interval          = 50,
         connectivity_weight_max             = 1.5,
         eib_posthoc_duration_ms             = 720_000,

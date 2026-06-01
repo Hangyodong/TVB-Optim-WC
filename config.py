@@ -25,7 +25,7 @@ class Config:
     fc_csv:         str = "FC_compact.csv"
     cache_root_dir: str = "./cache"
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25_p26_p27"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25_p26_p27_p31"
 
     # ── Wilson-Cowan model parameters (Patch 15) ──────────────
     # dataset="human": SanzLeonet 2014 / dataset="mouse": current
@@ -91,6 +91,7 @@ class Config:
     eib_internal_fic_learning_rate: float = 0.05
     eib_max_weight_learning_rate:   float = 0.002
     eib_bold_window_samples:        int   = 150
+    eib_update_interval:            int   = 1     # wLRE/wFFI update every N TR (1=every TR)
     eib_snapshot_save_interval:     int   = 50
     connectivity_weight_max:        float = 1.5
 

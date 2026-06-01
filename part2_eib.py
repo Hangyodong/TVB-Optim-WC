@@ -204,14 +204,20 @@ def _run_eib_loop_pure(
             (step_index + 1) / cfg.eib_max_iterations
         ) * cfg.eib_max_weight_learning_rate
 
-        wLRE_new, wFFI_new = _eib_update_rule(
-            tuned_state.coupling.coupling.wLRE,
-            tuned_state.coupling.coupling.wFFI,
-            window_fc, fc_target,
-            eta_eib=current_eta,
-            sc_mask=sc_mask,
-            w_max=w_max,
-        )
+        if step_index % cfg.eib_update_interval == 0:
+            wLRE_new, wFFI_new = _eib_update_rule(
+                tuned_state.coupling.coupling.wLRE,
+                tuned_state.coupling.coupling.wFFI,
+                window_fc, fc_target,
+                eta_eib=current_eta,
+                sc_mask=sc_mask,
+                w_max=w_max,
+            )
+        else:
+            wLRE_new, wFFI_new = (
+                tuned_state.coupling.coupling.wLRE,
+                tuned_state.coupling.coupling.wFFI,
+            )
 
         c_ei_clean = jnp.clip(
             jnp.where(jnp.isfinite(tuned_state.dynamics.c_ei), tuned_state.dynamics.c_ei, 6.0),
