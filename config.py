@@ -95,14 +95,14 @@ class Config:
     connectivity_weight_max:        float = 1.5
 
     eib_posthoc_top_k:              int   = 10
-    eib_posthoc_duration_ms:        int   = 300_000
+    eib_posthoc_duration_ms:        int   = 720_000
     eib_posthoc_skip_tr:            int   = 20
 
     # ── Part 3 — Full-matrix gradient ────────────────────────
     optimizer_learning_rate:  float = 0.002
     optimizer_max_steps:      int   = 200
     optimizer_chunk_steps:    int   = 5
-    optimizer_bold_window_tr: int   = 96
+    optimizer_bold_window_tr: int   = 720
     optimizer_bold_skip_tr:   int   = 8
 
     # ── Part 3B — Low-rank gradient ──────────────────────────
