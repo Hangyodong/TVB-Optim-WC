@@ -23,9 +23,10 @@ class Config:
     sc_csv:         str = "weight.csv"
     length_csv:     str = "tract_length.csv"
     fc_csv:         str = "FC_compact.csv"
-    cache_root_dir: str = "./cache"
+    cache_root_dir: str = "./cache"      # (deprecated; 경로 빌드에 미사용)
+    cache_run_label: str = "nor_42"      # 캐시 저장/로드 폴더 이름 → optim/cache/<label>/<cache_tag>
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25_p26_p27_p31"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25_p26_p27_p31_p32capfix"
 
     # ── Wilson-Cowan model parameters (Patch 15) ──────────────
     # dataset="human": SanzLeonet 2014 / dataset="mouse": current
@@ -85,13 +86,18 @@ class Config:
     fic_early_stop_tolerance_hz: float = 0.10
     fic_step_duration_ms:        int   = 1_000
     fic_step_skip_tr:            int   = 0
+    # best 후보 post-hoc 평가용 (EIB posthoc 기본값과 동일)
+    fic_posthoc_duration_ms:     int   = 720_000
+    fic_posthoc_skip_tr:         int   = 20
+    # True: lock per-node c_ei after FIC (EIB / Part3 / Part3B keep it frozen).
+    # False (default): old-logic — c_ei keeps updating through EIB and gradient.
+    freeze_c_ei_after_fic:       bool  = False
 
     # ── Part 2 — EIB ─────────────────────────────────────────
     eib_max_iterations:             int   = 8000
     eib_internal_fic_learning_rate: float = 0.05
     eib_max_weight_learning_rate:   float = 0.002
     eib_bold_window_samples:        int   = 150
-    eib_update_interval:            int   = 1     # wLRE/wFFI update every N TR (1=every TR)
     eib_snapshot_save_interval:     int   = 50
     connectivity_weight_max:        float = 1.5
 
@@ -104,18 +110,7 @@ class Config:
     optimizer_chunk_steps:    int   = 5
     optimizer_bold_window_tr: int   = 720
     optimizer_bold_skip_tr:   int   = 8
-
-    # ── Part 3B — Low-rank gradient ──────────────────────────
-    lowrank_rank:            int   = 6
-    lowrank_max_steps:       int   = 120
-    lowrank_learning_rate:   float = 0.002
-    lowrank_bold_window_tr:  int   = 96
-    lowrank_bold_skip_tr:    int   = 8
-    lowrank_delta_scale:     float = 0.15
-    lowrank_factor_init:     float = 0.01
-    lowrank_activity_weight: float = 0.01
-    lowrank_factor_penalty:  float = 1e-4
-    lowrank_seed:            int   = 17
+    optimizer_activity_weight: float = 0.01   # full-matrix activity reg weight (was hardcoded)
 
     # ── Phase 1 final baseline settle ────────────────────────
     baseline_settle_duration_ms: Optional[int] = 0
@@ -131,9 +126,6 @@ class Config:
     optimizer_global_corr_weight:   float = 0.4   # alpha: global FC corr
     optimizer_nodewise_corr_weight: float = 0.4   # beta:  node-wise FC corr
     optimizer_rmse_weight:          float = 0.2   # gamma: global FC RMSE
-    lowrank_global_corr_weight:     float = 0.4
-    lowrank_nodewise_corr_weight:   float = 0.4
-    lowrank_rmse_weight:            float = 0.2
 
     pd_fit_region_indices: Optional[Sequence[int]] = None
     pd_fit_region_labels:  Optional[Sequence[str]] = None
@@ -142,8 +134,9 @@ class Config:
     dbs_pulse_amplitude:             float = 1.0
     dbs_stimulation_frequency_hz:    float = 130.0
     dbs_phase_duration_steps:        int   = 1
-    dbs_pre_stimulation_duration_ms: float = 60_000.0
+    dbs_pre_stimulation_duration_ms: float = 720_000.0
     dbs_stimulation_duration_ms:     float = 60_000.0
+    dbs_fc_pre_transient_skip_ms:    float = 60_000.0   # pre-stim FC에서 버릴 앞부분 transient
     dbs_target_regions: dict = field(default_factory=lambda: {
         "STN_L": 11,
         "GPe_L": 5,

@@ -155,16 +155,16 @@ def _run_eib_loop_pure(
 
     for step_index in range(cfg.eib_max_iterations):
         step_result = update_model(tuned_state)
-        raw_arr = np.asarray(step_result.data)
 
-        if not np.all(np.isfinite(raw_arr)):
+        # device-side 스칼라 reduction → 전체 배열을 host로 끌어오지 않고 1 bool만 동기화
+        if not bool(jnp.all(jnp.isfinite(step_result.data))):
             print(f"[WARN] Non-finite state at step {step_index + 1}. Stopping.")
             break
 
         bold_output = tuned_bold_monitor(step_result)
         bold_vector = bold_output.ys[0, 0, :]
 
-        if not np.all(np.isfinite(np.asarray(bold_vector))):
+        if not bool(jnp.all(jnp.isfinite(bold_vector))):
             print(f"[WARN] Non-finite BOLD at step {step_index + 1}. Stopping.")
             break
 
@@ -191,10 +191,13 @@ def _run_eib_loop_pure(
             )
 
         window_fc = _compute_fc_from_buffer(bold_rolling_buffer)
-        if not (
-            np.all(np.isfinite(np.asarray(window_fc)))
-            and np.nanstd(np.asarray(window_fc)) > 1e-8
-        ):
+        # finite & std>1e-8 판정을 device에서 끝내고 1 bool만 동기화
+        # (finite한 경우 nanstd == std이므로 nan_to_num std와 동치)
+        window_fc_ok = bool(
+            jnp.all(jnp.isfinite(window_fc))
+            & (jnp.std(jnp.nan_to_num(window_fc)) > 1e-8)
+        )
+        if not window_fc_ok:
             continue
 
         if pre_window_fc is None:
@@ -204,20 +207,14 @@ def _run_eib_loop_pure(
             (step_index + 1) / cfg.eib_max_iterations
         ) * cfg.eib_max_weight_learning_rate
 
-        if step_index % cfg.eib_update_interval == 0:
-            wLRE_new, wFFI_new = _eib_update_rule(
-                tuned_state.coupling.coupling.wLRE,
-                tuned_state.coupling.coupling.wFFI,
-                window_fc, fc_target,
-                eta_eib=current_eta,
-                sc_mask=sc_mask,
-                w_max=w_max,
-            )
-        else:
-            wLRE_new, wFFI_new = (
-                tuned_state.coupling.coupling.wLRE,
-                tuned_state.coupling.coupling.wFFI,
-            )
+        wLRE_new, wFFI_new = _eib_update_rule(
+            tuned_state.coupling.coupling.wLRE,
+            tuned_state.coupling.coupling.wFFI,
+            window_fc, fc_target,
+            eta_eib=current_eta,
+            sc_mask=sc_mask,
+            w_max=w_max,
+        )
 
         c_ei_clean = jnp.clip(
             jnp.where(jnp.isfinite(tuned_state.dynamics.c_ei), tuned_state.dynamics.c_ei, 6.0),
@@ -232,33 +229,40 @@ def _run_eib_loop_pure(
         fc_correlation_history.append(win_corr)
         fc_rmse_history.append(win_rmse)
 
-        current_params = ParamSet(
-            c_ei=np.asarray(tuned_state.dynamics.c_ei, dtype=np.float32),
-            wLRE=np.asarray(tuned_state.coupling.coupling.wLRE, dtype=np.float32),
-            wFFI=np.asarray(tuned_state.coupling.coupling.wFFI, dtype=np.float32),
-            c_ei_frozen=bundle_in.params.c_ei_frozen,
-        ).sanitize(data["sc_mask"], cfg.connectivity_weight_max)
-
-        current_bundle = bundle_in.advance(
-            new_params=current_params,
-            new_init_dynamics=np.asarray(tuned_state.initial_state.dynamics, dtype=np.float32),
-            new_bold_history=np.asarray(tuned_bold_monitor.history, dtype=np.float32),
-            new_bold_window=np.asarray(bold_rolling_buffer[:, 0, :], dtype=np.float32),
-            new_internal_state=internal_state,
-            new_delay_history=bundle_in.delay_history,
-            next_stage="eib_search",
-            metadata_update=metadata,
-        )
-
         full_term = cfg.correlation_loss_weight * (1 - win_corr) + cfg.rmse_loss_weight * win_rmse
         win_score = -(cfg.full_brain_fc_loss_weight * full_term)
 
-        if np.isfinite(win_score) and win_score > best_window_score:
+        # current_bundle은 new-best이거나 snapshot step일 때만 실제로 소비된다.
+        # 둘 다 아니면 빌드를 건너뛰어 c_ei/wLRE/wFFI/init_dynamics/bold_history(매 step
+        # 증가)/bold_window의 매 iteration host 전송을 제거한다.
+        is_new_best = np.isfinite(win_score) and win_score > best_window_score
+        is_snapshot_step = (step_index + 1) % cfg.eib_snapshot_save_interval == 0
+
+        if is_new_best or is_snapshot_step:
+            current_params = ParamSet(
+                c_ei=np.asarray(tuned_state.dynamics.c_ei, dtype=np.float32),
+                wLRE=np.asarray(tuned_state.coupling.coupling.wLRE, dtype=np.float32),
+                wFFI=np.asarray(tuned_state.coupling.coupling.wFFI, dtype=np.float32),
+                c_ei_frozen=bundle_in.params.c_ei_frozen,
+            ).sanitize(data["sc_mask"], cfg.connectivity_weight_max)
+
+            current_bundle = bundle_in.advance(
+                new_params=current_params,
+                new_init_dynamics=np.asarray(tuned_state.initial_state.dynamics, dtype=np.float32),
+                new_bold_history=np.asarray(tuned_bold_monitor.history, dtype=np.float32),
+                new_bold_window=np.asarray(bold_rolling_buffer[:, 0, :], dtype=np.float32),
+                new_internal_state=internal_state,
+                new_delay_history=bundle_in.delay_history,
+                next_stage="eib_search",
+                metadata_update=metadata,
+            )
+
+        if is_new_best:
             best_window_score = win_score
             window_best_bundle = current_bundle
             window_best_corr = win_corr
 
-        if (step_index + 1) % cfg.eib_snapshot_save_interval == 0:
+        if is_snapshot_step:
             snapshot_bundle_dicts.append(current_bundle.to_dict())
             snapshot_iterations.append(step_index + 1)
             snapshot_window_corrs.append(win_corr)
@@ -540,7 +544,7 @@ def _eib_update_rule(
 
 def _clip_sym(w, sc_mask: np.ndarray, w_max: float):
     w = jnp.where(jnp.isfinite(w), w, 0.0)
-    w = jnp.clip(w, 0.0, None) * jnp.asarray(sc_mask)  # Patch: 상한 제거
+    w = jnp.clip(w, 0.0, w_max) * jnp.asarray(sc_mask)  # restore w_max cap (revert patch19)
     return 0.5 * (w + w.T)
 
 
