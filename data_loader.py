@@ -59,7 +59,7 @@ def load_data(cfg: Config) -> dict:
     )
 
     cache_tag = _build_cache_tag(cfg.cache_version, n_nodes, weights, fc_target)
-    cache_dir = _create_cache_dir(cfg.cache_root_dir, cache_tag)
+    cache_dir = _create_cache_dir(cfg.cache_run_label, cache_tag)
 
     graph = DenseDelayGraph(
         weights.astype(np.float64),
@@ -232,8 +232,10 @@ def _build_cache_tag(
     )
 
 
-def _create_cache_dir(cache_root: str, cache_tag: str) -> str:
-    cache_dir = os.path.join(cache_root, cache_tag)
-    os.makedirs(cache_dir, exist_ok=True)
-    set_cache_path(cache_dir)
-    return cache_dir
+def _create_cache_dir(cache_run_label: str, cache_tag: str) -> str:
+    # 라이브러리(set_cache_path)가 optim/cache 를 root로 잡고 experiment 하위에 저장한다.
+    # experiment = "<cache_run_label>/<cache_tag>" → optim/cache/<label>/<tag>
+    experiment = os.path.join(cache_run_label, cache_tag)
+    cache_path = set_cache_path(experiment)   # 실제 절대 저장 경로 반환
+    os.makedirs(cache_path, exist_ok=True)
+    return cache_path

@@ -75,7 +75,7 @@ from data_loader         import load_data
 from model               import build_network
 from part1_fic           import run_fic
 from part2_eib           import run_eib
-from part3_gradient      import run_gradient_optimization, run_lowrank_optimization
+from part3_gradient      import run_gradient_optimization
 from part4_dbs           import run_dbs_stimulation
 from pipeline_contracts  import (
     ParamSet,
@@ -94,10 +94,19 @@ def parse_args():
     parser.add_argument("--skip-fic",      action="store_true", help="FIC 건너뜀")
     parser.add_argument("--skip-eib",      action="store_true", help="EIB 건너뜀")
     parser.add_argument("--skip-gradient", action="store_true", help="Gradient 건너뜀")
-    parser.add_argument("--skip-lowrank",  action="store_true", help="LowRank 건너뜀")
     parser.add_argument("--skip-dbs",      action="store_true", help="DBS 건너뜀")
     parser.add_argument("--fic-only",      action="store_true", help="FIC만 실행")
     parser.add_argument("--resume",        action="store_true", help="캐시 이어서 실행")
+    parser.add_argument(
+        "--freeze-c-ei", dest="freeze_c_ei",
+        default=None, action="store_true",
+        help="FIC 후 c_ei 동결(고정). 미지정 시 Config 기본값 사용",
+    )
+    parser.add_argument(
+        "--no-freeze-c-ei", dest="freeze_c_ei",
+        action="store_false",
+        help="FIC 후 c_ei 학습 허용(동결 해제)",
+    )
     return parser.parse_args()
 
 # ── 3. Dataset별 파라미터 (노트북 Cell 4와 동일) ─────────────────────────
@@ -117,12 +126,15 @@ _DATASET_PARAMS = {
         wc_rE_max_hz=20.0, wc_rI_max_hz=20.0,
         wc_c_ei_init=6.0,
         fic_target_firing_rate_hz=4.0,
-        # DBS targets (PD25subcortex, 0-based node index)
+        # DBS targets (Schaefer200_7net + PD25subcortex, 0-based node index)
+        # 라벨 파일 1-based: STN 205/206, GPe 211/212, GPi 213/214 -> 0-based 아래
         dbs_target_regions={
-            "STN_L": 404,
-            "GPe_L": 410,
-            "GPe_R": 411,
-            "GPi_L": 412,
+            "STN_L": 204,  # Left_subthalamic_nucleus
+            "STN_R": 205,  # Right_subthalamic_nucleus
+            "GPe_L": 210,  # Left_globus_pallidus_externa
+            "GPe_R": 211,  # Right_globus_pallidus_externa
+            "GPi_L": 212,  # Left_globus_pallidus_interna
+            "GPi_R": 213,  # Right_globus_pallidus_interna
         },
         # Bold HRF: library defaults for human
         bold_hrf_k1=5.6,
@@ -131,10 +143,10 @@ _DATASET_PARAMS = {
         bold_hrf_tau_f=0.4,
         bold_hrf_scaling=1.0 / 3.0,
         bold_hrf_duration_ms=20_000.0,  # 20s (library default)
-        sc_csv="human/weight.csv",
-        length_csv="human/tract_length.csv",
-        fc_csv="human/fc_matrix.csv",
-        region_txt="human/Custom_Schaefer400_PD25subcortex_1mm.txt",
+        sc_csv="human/100206_SC_weight.csv",
+        length_csv="human/100206_SC_tract_length.csv",
+        fc_csv="human/100206_FC_matrix.csv",
+        region_txt="human/Custom_Schaefer200_7net_PD25subcortex_1mm.txt",
         tract_conduction_speed=1.0,
         additive_noise_sigma=0.01,
     ),
@@ -188,7 +200,7 @@ def make_config(dataset: str) -> Config:
 
         # ── 캐시 (노트북 Cell 5와 동일: 기존 캐시 재사용) ────────
         cache_version                       = f"v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_{dataset}",
-        cache_root_dir                      = f"./cache/cache/{dataset}",
+        cache_run_label                     = ("nor_42" if dataset == "mouse" else f"nor_{dataset}"),
 
         # ── 시뮬레이션 공통 ──────────────────────────────────────
         integration_dt_ms                   = 1.0,
@@ -205,6 +217,7 @@ def make_config(dataset: str) -> Config:
         fic_early_stop_tolerance_hz         = 0.10,
         fic_step_duration_ms                = 1_000,
         fic_step_skip_tr                    = 0,
+        freeze_c_ei_after_fic               = False,   # True: Part2(EIB)에서만 c_ei 동결. Part3는 항상 c_ei 최적화
 
         # ── Part 2 — EIB (구버전 notebook 로직) ─────────────────
         eib_max_iterations                  = 8000,
@@ -223,18 +236,6 @@ def make_config(dataset: str) -> Config:
         optimizer_bold_window_tr            = 720,
         optimizer_bold_skip_tr              = 60,
 
-        # ── Part 3B — Low-rank (Full Gradient 결과 기반) ────────
-        lowrank_rank                        = 6,
-        lowrank_max_steps                   = 300,
-        lowrank_learning_rate               = 0.0002,
-        lowrank_bold_window_tr              = 720,
-        lowrank_bold_skip_tr                = 60,
-        lowrank_delta_scale                 = 0.15,
-        lowrank_factor_init                 = 0.01,
-        lowrank_activity_weight             = 0.01,
-        lowrank_factor_penalty              = 1e-4,
-        lowrank_seed                        = 17,
-
         # ── Phase 1 final baseline settle ────────────────────────
         baseline_settle_duration_ms         = 0,
 
@@ -245,21 +246,19 @@ def make_config(dataset: str) -> Config:
         correlation_loss_weight             = 0.80,
         rmse_loss_weight                    = 0.20,
 
-        # ── Patch 9: Gradient / LowRank 3-term loss weights ──────
+        # ── Patch 9: Gradient 3-term loss weights ────────────────
         optimizer_global_corr_weight        = 0.40,
         optimizer_nodewise_corr_weight      = 0.40,
         optimizer_rmse_weight               = 0.20,
-        lowrank_global_corr_weight          = 0.40,
-        lowrank_nodewise_corr_weight        = 0.40,
-        lowrank_rmse_weight                 = 0.20,
 
         # ── Part 4 — DBS ─────────────────────────────────────────
         dbs_target_regions           = p["dbs_target_regions"],
         dbs_pulse_amplitude                 = 10.0,
         dbs_stimulation_frequency_hz        = 130.0,
         dbs_phase_duration_steps            = 1,
-        dbs_pre_stimulation_duration_ms     = 60_000.0,
+        dbs_pre_stimulation_duration_ms     = 720_000.0,
         dbs_stimulation_duration_ms         = 60_000.0,
+        dbs_fc_pre_transient_skip_ms        = 60_000.0,   # pre-stim FC 앞 transient 제거
 
         # ── WC model params (dataset별 자동 설정, Patch 15) ─────
         wc_c_ee      = p["wc_c_ee"],
@@ -311,11 +310,13 @@ def main():
     if args.fic_only:
         args.skip_eib      = True
         args.skip_gradient = True
-        args.skip_lowrank  = True
         args.skip_dbs      = True
 
     # Config (Cell 5)
     cfg = make_config(args.dataset)
+    if args.freeze_c_ei is not None:               # CLI override (--freeze-c-ei / --no-freeze-c-ei)
+        cfg.freeze_c_ei_after_fic = args.freeze_c_ei
+    print(f"[cfg] freeze_c_ei_after_fic={cfg.freeze_c_ei_after_fic}")
     cfg.print_summary()
 
     # Data loading (Cell 7)
@@ -392,57 +393,12 @@ def main():
         print("\n[3] Gradient skipped (--skip-gradient)")
         bundle_grad = bundle_eib
 
-    # Part 3B: LowRank (Cell 19)
-    if not args.skip_lowrank:
-        print("\n[3B] Running LowRank Optimization...")
-        bundle_lowrank = run_lowrank_optimization(
-            network       = network,
-            bundle_in     = bundle_grad,
-            warmup_bundle = bundle_init,
-            cfg           = cfg,
-            data          = data,
-        )
-        print(f"[Part3B] stage={bundle_lowrank.stage}  c_ei_frozen={bundle_lowrank.params.c_ei_frozen}")
-        print(bundle_lowrank)
-    else:
-        print("\n[3B] LowRank skipped (--skip-lowrank)")
-        bundle_lowrank = bundle_grad
-
-    # Part 4: DBS — grad vs lowrank corr 비교 후 best bundle 선택 (Cell 21)
+    # Part 4: DBS — 항상 Part 3 (Full Gradient) 결과를 입력으로 사용 (Cell 21)
     if not args.skip_dbs:
         print("\n[4] Running DBS Stimulation...")
-        from part3_gradient import compute_simulated_fc
-        from tvboptim.observations.observation import fc_corr
-        import jax.numpy as _jnp
-
-        _fc_target = _jnp.asarray(data["fc_target"])
-        _sim_ms  = 180_000
-        _skip_tr = 30
-
-        print("\n" + "=" * 52)
-        print("  DBS input bundle 선택 (grad vs lowrank)")
-        print("=" * 52)
-
-        _fc_grad = compute_simulated_fc(network, bundle_grad, cfg, _sim_ms, _skip_tr)
-        _corr_grad = float(fc_corr(_jnp.asarray(_fc_grad), _fc_target))
-        print(f"  grad    corr={_corr_grad:.4f}")
-
-        _fc_lr = compute_simulated_fc(network, bundle_lowrank, cfg, _sim_ms, _skip_tr)
-        _corr_lr = float(fc_corr(_jnp.asarray(_fc_lr), _fc_target))
-        print(f"  lowrank corr={_corr_lr:.4f}")
-
-        print("-" * 52)
-        if _corr_lr >= _corr_grad:
-            bundle_for_dbs = bundle_lowrank
-            print(f"  → DBS input: lowrank  (corr={_corr_lr:.4f})")
-        else:
-            bundle_for_dbs = bundle_grad
-            print(f"  → DBS input: grad  (corr={_corr_grad:.4f})")
-        print("=" * 52 + "\n")
-
         run_dbs_stimulation(
             network   = network,
-            bundle_in = bundle_for_dbs,
+            bundle_in = bundle_grad,
             cfg       = cfg,
             data      = data,
         )

@@ -92,11 +92,6 @@ check("part2_eib.py: old N×N update removed",
     lambda: _assert_not_in(
         'wLRE + eta_eib * fc_diff * row_rmse', read('part2_eib.py')))
 
-check("part3_gradient.py: lowrank base broadcast present",
-    lambda: _assert_in(
-        'wLRE_base_mat = jnp.asarray(wLRE_base)[:, None]',
-        read('part3_gradient.py')))
-
 def _check_paramset_shape():
     try:
         sys.path.insert(0, str(ROOT))
@@ -191,9 +186,6 @@ check("part3_gradient.py: optimizer_nodewise_corr_weight used",
 check("part3_gradient.py: optimizer_rmse_weight used",
     lambda: _assert_in('optimizer_rmse_weight', g3))
 
-check("part3_gradient.py: lowrank_global_corr_weight used",
-    lambda: _assert_in('lowrank_global_corr_weight', g3))
-
 check("part3_gradient.py: old single-term loss removed",
     lambda: _assert_not_in('return corr_l + 0.01 * act_l', g3))
 
@@ -209,10 +201,7 @@ def _cfg_new_fields():
     c = Config()
     for field in ['optimizer_global_corr_weight',
                   'optimizer_nodewise_corr_weight',
-                  'optimizer_rmse_weight',
-                  'lowrank_global_corr_weight',
-                  'lowrank_nodewise_corr_weight',
-                  'lowrank_rmse_weight']:
+                  'optimizer_rmse_weight']:
         assert hasattr(c, field), f"{field} missing"
     assert abs(c.optimizer_global_corr_weight   - 0.4) < 1e-6
     assert abs(c.optimizer_nodewise_corr_weight - 0.4) < 1e-6
@@ -256,9 +245,6 @@ for param, val in [
     ('optimizer_max_steps                 = 2000',   '2000'),
     ('optimizer_chunk_steps               = 10',     '10'),
     ('optimizer_bold_window_tr            = 240',    '240'),
-    ('lowrank_max_steps                   = 200',    '200'),
-    ('lowrank_learning_rate               = 0.0002', '0.0002'),
-    ('lowrank_bold_window_tr              = 240',    '240'),
 ]:
     def _chk(p=param): _assert_in(p, src)
     check(f"Cell 3: {param.split('=')[0].strip()} = {val}", _chk)
@@ -273,8 +259,7 @@ check("Cell 3: old optimizer_max_steps=1000 removed",
 
 for field in ['optimizer_global_corr_weight',
               'optimizer_nodewise_corr_weight',
-              'optimizer_rmse_weight',
-              'lowrank_global_corr_weight']:
+              'optimizer_rmse_weight']:
     def _chk(f=field): _assert_in(f, src)
     check(f"Cell 3: {field} present", _chk)
 
