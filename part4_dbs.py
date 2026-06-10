@@ -25,6 +25,7 @@ from tvboptim.experimental.network_dynamics import prepare
 from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
 
 from config import Config
+from model import _rww_H
 from pipeline_contracts import StateBundle, build_bundle_from_legacy_state
 
 
@@ -95,6 +96,7 @@ def run_dbs_stimulation(
             n_nodes=n_nodes,
             derived=derived,
             cfg=cfg,
+            data=data,
             stimulus_modes=stimulus_modes,
             prebuilt_stim_array=_all_stim_arrays[target_label],
         )
@@ -140,6 +142,7 @@ def _run_single_target(
     n_nodes,
     derived,
     cfg,
+    data,
     stimulus_modes,
     prebuilt_stim_array=None,  # Patch 4: 미리 빌드된 stim 배열 (None이면 내부에서 생성)
 ) -> None:
@@ -216,6 +219,18 @@ def _run_single_target(
             observable_name=observable_name,
         )
 
+        # 자극 전(pre) vs 자극 중(during) BOLD 기반 simulated FC + 차이 행렬 저장
+        _compute_and_save_dbs_fc(
+            simulation_result=simulation_result,
+            bundle_base=bundle_base,
+            onset_step=onset_step,
+            stim_steps=stim_steps,
+            target_label=target_label,
+            cfg=cfg,
+            data=data,
+            save_dir=mode_save_dir,
+        )
+
 
 # ── 자극 dynamics 생성 ───────────────────────────────────────
 
@@ -233,36 +248,30 @@ def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_
         )
         stimulus_vector = jnp.asarray(stimulation_jax[time_step_index], dtype=dtype)
 
-        alpha_e = jnp.asarray(params.alpha_e, dtype=dtype)
-        alpha_i = jnp.asarray(params.alpha_i, dtype=dtype)
-        c_ee = jnp.asarray(params.c_ee, dtype=dtype)
-        c_ei = jnp.asarray(params.c_ei, dtype=dtype)
-        c_ie = jnp.asarray(params.c_ie, dtype=dtype)
-        c_ii = jnp.asarray(params.c_ii, dtype=dtype)
-        P = jnp.asarray(params.P, dtype=dtype)
-        Q = jnp.asarray(params.Q, dtype=dtype)
+        # Reduced Wong-Wang params (model.py ReducedWongWangEIB 와 동일)
+        J_N = jnp.asarray(params.J_N, dtype=dtype)
+        w_p = jnp.asarray(params.w_p, dtype=dtype)
+        c_ei = jnp.asarray(params.c_ei, dtype=dtype)   # == J_i
+        W_e = jnp.asarray(params.W_e, dtype=dtype)
+        W_i = jnp.asarray(params.W_i, dtype=dtype)
+        I_o = jnp.asarray(params.I_o, dtype=dtype)
         I_ext = jnp.asarray(params.I_ext, dtype=dtype)
-        theta_e = jnp.asarray(params.theta_e, dtype=dtype)
-        theta_i = jnp.asarray(params.theta_i, dtype=dtype)
         lamda = jnp.asarray(params.lamda, dtype=dtype)
         a_e = jnp.asarray(params.a_e, dtype=dtype)
-        a_i = jnp.asarray(params.a_i, dtype=dtype)
         b_e = jnp.asarray(params.b_e, dtype=dtype)
-        b_i = jnp.asarray(params.b_i, dtype=dtype)
-        c_e = jnp.asarray(params.c_e, dtype=dtype)
-        c_i = jnp.asarray(params.c_i, dtype=dtype)
-        k_e = jnp.asarray(params.k_e, dtype=dtype)
-        k_i = jnp.asarray(params.k_i, dtype=dtype)
-        r_e = jnp.asarray(params.r_e, dtype=dtype)
-        r_i = jnp.asarray(params.r_i, dtype=dtype)
+        d_e = jnp.asarray(params.d_e, dtype=dtype)
+        gamma_e = jnp.asarray(params.gamma_e, dtype=dtype)
         tau_e = jnp.asarray(params.tau_e, dtype=dtype)
+        a_i = jnp.asarray(params.a_i, dtype=dtype)
+        b_i = jnp.asarray(params.b_i, dtype=dtype)
+        d_i = jnp.asarray(params.d_i, dtype=dtype)
+        gamma_i = jnp.asarray(params.gamma_i, dtype=dtype)
         tau_i = jnp.asarray(params.tau_i, dtype=dtype)
-        rE_max_hz = jnp.asarray(params.rE_max_hz, dtype=dtype)
-        rI_max_hz = jnp.asarray(params.rI_max_hz, dtype=dtype)
-        clip_lo = jnp.asarray(-500.0, dtype=dtype)
-        clip_hi = jnp.asarray(500.0, dtype=dtype)
+        one = jnp.asarray(1.0, dtype=dtype)
         half = jnp.asarray(0.5, dtype=dtype)
 
+        # 자극 분배: inside_stim → x_e_pre 직접 주입(I_ext 자리),
+        #            outside_stim → dS_e_dt 에 가산(TVB default 방식)
         if stimulus_mode == "true_p_t":
             inside_stim = stimulus_vector
             outside_stim = jnp.zeros_like(stimulus_vector)
@@ -275,49 +284,36 @@ def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_
         else:
             raise ValueError(f"Unsupported stimulus_mode: {stimulus_mode}")
 
-        excitatory_input = alpha_e * (
-            c_ee * excitatory_activity
-            - c_ei * inhibitory_activity
-            + P
+        S_e = excitatory_activity
+        S_i = inhibitory_activity
+        c_lre = J_N * long_range_excitation
+        c_ffi = J_N * feedforward_inhibition
+        J_N_S_e = J_N * S_e
+
+        # Excitatory input (c_ei == J_i). inside_stim 을 I_ext 와 같은 자리에 주입.
+        x_e_pre = (
+            w_p * J_N_S_e
+            - c_ei * S_i
+            + W_e * I_o
+            + c_lre
             + I_ext
             + inside_stim
-            - theta_e
-            + long_range_excitation
         )
-        inhibitory_input = alpha_i * (
-            c_ie * excitatory_activity
-            - c_ii * inhibitory_activity
-            + Q
-            - theta_i
-            + lamda * feedforward_inhibition
-        )
-
-        sigmoid_excitatory = c_e / (
-            jnp.asarray(1.0, dtype=dtype) + jnp.exp(-jnp.clip(a_e * (excitatory_input - b_e), clip_lo, clip_hi))
-        )
-        sigmoid_inhibitory = c_i / (
-            jnp.asarray(1.0, dtype=dtype) + jnp.exp(-jnp.clip(a_i * (inhibitory_input - b_i), clip_lo, clip_hi))
-        )
-
-        excitatory_derivative = (
-            -excitatory_activity
-            + (k_e - r_e * excitatory_activity) * sigmoid_excitatory
-        ) / tau_e
+        x_e = a_e * x_e_pre - b_e
+        H_e = _rww_H(x_e, d_e)
+        excitatory_derivative = -(S_e / tau_e) + (one - S_e) * H_e * gamma_e
         excitatory_derivative = excitatory_derivative + outside_stim
 
-        inhibitory_derivative = (
-            -inhibitory_activity
-            + (k_i - r_i * inhibitory_activity) * sigmoid_inhibitory
-        ) / tau_i
+        # Inhibitory input
+        x_i_pre = J_N_S_e - S_i + W_i * I_o + lamda * c_ffi
+        x_i = a_i * x_i_pre - b_i
+        H_i = _rww_H(x_i, d_i)
+        inhibitory_derivative = -(S_i / tau_i) + H_i * gamma_i
 
         return (
             jnp.stack([excitatory_derivative, inhibitory_derivative], axis=0),
-            jnp.stack([
-                sigmoid_excitatory,
-                sigmoid_inhibitory,
-                rE_max_hz * sigmoid_excitatory,
-                rI_max_hz * sigmoid_inhibitory,
-            ], axis=0),
+            # aux = [S_e, S_i, H_e(rE_hz), H_i(rI_hz)] — model.py 와 동일 레이아웃
+            jnp.stack([S_e, S_i, H_e, H_i], axis=0),
         )
 
     return stimulated_dynamics
@@ -405,6 +401,135 @@ def _analyze_and_plot(
         "psd_pre_v2_per_hz": psd_pre,
         "psd_during_v2_per_hz": psd_during,
     }).to_csv(os.path.join(save_dir, "psd_pre_vs_during.csv"), index=False)
+
+
+# ── simulated FC (자극 전/중) ─────────────────────────────────
+
+def _fc_from_timeseries(ts_2d: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """[n_samples, n_nodes] 시계열 → z-score Pearson FC 행렬 (대각=0).
+    파이프라인 _compute_fc_from_bold_output과 동일한 방식."""
+    ts = np.nan_to_num(np.asarray(ts_2d, dtype=np.float32))
+    ts = ts - ts.mean(axis=0, keepdims=True)
+    std = np.maximum(ts.std(axis=0, keepdims=True), eps)
+    ts_norm = ts / std
+    fc = (ts_norm.T @ ts_norm) / max(ts_norm.shape[0] - 1, 1)
+    fc = np.clip(fc, -1.0, 1.0).astype(np.float32)
+    np.fill_diagonal(fc, 0.0)
+    return fc
+
+
+def _compute_and_save_dbs_fc(
+    simulation_result,
+    bundle_base: StateBundle,
+    onset_step,
+    stim_steps,
+    target_label,
+    cfg,
+    data,
+    save_dir,
+) -> None:
+    """
+    DBS 신경 시뮬에서 BOLD 기반 simulated FC를 계산해 저장한다.
+      - 자극 전(pre) 윈도우 FC, 자극 중(during) 윈도우 FC
+      - 차이 행렬(during - pre, 원소별 변화)
+    파이프라인 simulated FC와 동일하게 BOLD monitor + z-score 상관으로 계산하며,
+    pre 윈도우는 앞 transient 구간(cfg.dbs_fc_pre_transient_skip_ms)을, during 윈도우는
+    HRF settling 만큼 앞부분을 skip한다.
+    """
+    try:
+        bold_monitor = bundle_base.build_bold_monitor(cfg)
+        bold_output = bold_monitor(simulation_result)
+        ys = np.asarray(bold_output.ys, dtype=np.float32)
+        ts = ys[:, 0, :] if ys.ndim == 3 else ys      # [n_tr, n_nodes]
+    except Exception as exc:
+        print(f"[DBS-FC] {target_label}: BOLD 생성 실패 → FC 건너뜀 ({exc})")
+        return
+
+    n_tr = int(ts.shape[0])
+    tr_ms = float(cfg.bold_repetition_time_ms)
+    pre_tr = int(round(cfg.dbs_pre_stimulation_duration_ms / tr_ms))
+    hrf_skip = int(round(getattr(cfg, "bold_hrf_duration_ms", 20_000.0) / tr_ms))
+    pre_skip = int(round(getattr(cfg, "dbs_fc_pre_transient_skip_ms", 60_000.0) / tr_ms))
+
+    # 윈도우 경계
+    #   pre   : 앞 transient(pre_skip) 만큼 버림
+    #   during: HRF settling(hrf_skip) 만큼 버림
+    pre_lo = max(0, min(pre_skip, pre_tr - 2))
+    pre_hi = min(pre_tr, n_tr)
+    dur_lo = min(pre_tr + hrf_skip, max(pre_tr, n_tr - 2))
+    dur_hi = n_tr
+
+    if pre_hi - pre_lo < 2 or dur_hi - dur_lo < 2:
+        print(
+            f"[DBS-FC] {target_label}: BOLD 샘플 부족(n_tr={n_tr}, "
+            f"pre[{pre_lo}:{pre_hi}], during[{dur_lo}:{dur_hi}]) → FC 건너뜀"
+        )
+        return
+
+    fc_pre = _fc_from_timeseries(ts[pre_lo:pre_hi])
+    fc_during = _fc_from_timeseries(ts[dur_lo:dur_hi])
+    fc_diff = (fc_during - fc_pre).astype(np.float32)
+
+    # 라벨 (가능하면 region 이름, 아니면 정수 인덱스)
+    labels = data.get("region_labels") if isinstance(data, dict) else None
+    if not labels or len(labels) != ts.shape[1]:
+        labels = [str(i) for i in range(ts.shape[1])]
+
+    pd.DataFrame(fc_pre, index=labels, columns=labels).to_csv(
+        os.path.join(save_dir, "fc_pre_stim.csv"))
+    pd.DataFrame(fc_during, index=labels, columns=labels).to_csv(
+        os.path.join(save_dir, "fc_during_stim.csv"))
+    pd.DataFrame(fc_diff, index=labels, columns=labels).to_csv(
+        os.path.join(save_dir, "fc_diff_during_minus_pre.csv"))
+
+    # off-diagonal 요약 통계
+    iu = np.triu_indices(fc_pre.shape[0], k=1)
+    pre_v, dur_v, diff_v = fc_pre[iu], fc_during[iu], fc_diff[iu]
+    fc_corr_pre_during = (
+        float(np.corrcoef(pre_v, dur_v)[0, 1]) if pre_v.size > 1 else float("nan")
+    )
+    pd.DataFrame({
+        "metric": [
+            "n_tr_total", "pre_window_tr", "during_window_tr",
+            "mean_fc_pre", "mean_fc_during",
+            "mean_diff_during_minus_pre", "mean_abs_diff", "max_abs_diff",
+            "corr_pre_vs_during",
+        ],
+        "value": [
+            n_tr, pre_hi - pre_lo, dur_hi - dur_lo,
+            float(pre_v.mean()), float(dur_v.mean()),
+            float(diff_v.mean()), float(np.abs(diff_v).mean()), float(np.abs(diff_v).max()),
+            fc_corr_pre_during,
+        ],
+    }).to_csv(os.path.join(save_dir, "fc_summary.csv"), index=False)
+
+    print(
+        f"[DBS-FC] {target_label}: pre[{pre_lo}:{pre_hi}] during[{dur_lo}:{dur_hi}]  "
+        f"mean|Δ|={np.abs(diff_v).mean():.4f}  max|Δ|={np.abs(diff_v).max():.4f}  "
+        f"corr(pre,during)={fc_corr_pre_during:.4f}"
+    )
+
+    _plot_dbs_fc(fc_pre, fc_during, fc_diff, target_label, save_dir)
+
+
+def _plot_dbs_fc(fc_pre, fc_during, fc_diff, target_label, save_dir) -> None:
+    dmax = float(np.nanmax(np.abs(fc_diff))) if np.isfinite(fc_diff).any() else 1.0
+    dmax = dmax if dmax > 0 else 1.0
+    panels = [
+        (fc_pre,    "Pre-stim FC",          -1.0,  1.0),
+        (fc_during, "During-stim FC",       -1.0,  1.0),
+        (fc_diff,   "ΔFC (during − pre)",  -dmax, dmax),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for ax, (mat, title, vlo, vhi) in zip(axes, panels):
+        im = ax.imshow(mat, cmap="RdBu_r", vmin=vlo, vmax=vhi, aspect="equal")
+        ax.set_title(f"{target_label} | {title}")
+        ax.set_xlabel("Region")
+        ax.set_ylabel("Region")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "fc_pre_during_diff.png"), dpi=150)
+    plt.show()
 
 
 # ── observable ───────────────────────────────────────────────

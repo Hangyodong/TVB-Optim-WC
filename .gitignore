@@ -1,9 +1,14 @@
 cache/
+_archive/
 optimized_params/
 dbs_analysis/
+dbs_analysis_nor/
+figures_*/
 paper_dbs_psd_*/
 paper_figures_*/
 all_figures_export_*/
+*.zip
+*.log
 *.csv
 *.txt
 *.patch*_backup
