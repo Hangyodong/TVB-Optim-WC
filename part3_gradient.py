@@ -5,12 +5,10 @@ Stage 3
 -------
 - Part 2 → Part 3 입력을 StateBundle로 통일한다.
 - full-matrix optimizer는 구버전 notebook 로직처럼 best params를 바로 반환한다.
-- Part 3B low-rank branch도 동일한 StateBundle 계약을 사용한다.
 - legacy notebook의 old-style 호출도 계속 허용한다.
 """
 import time
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -94,21 +92,11 @@ def run_gradient_optimization(
     """
     bundle_eib = _coerce_gradient_bundle(bundle_in, eib_results, cfg, data, stage="eib")
 
-    # Patch 26: optimize from warmup state (step 0) + EIB-tuned params,
-    # consistent with EIB post-hoc validation.
-    if warmup_bundle is not None:
-        bundle_start = warmup_bundle.advance(
-            new_params=bundle_eib.params,
-            new_init_dynamics=warmup_bundle.init_dynamics,
-            new_bold_history=warmup_bundle.bold_history,
-            new_bold_window=warmup_bundle.bold_window,
-            new_internal_state=warmup_bundle.internal_state,
-            new_delay_history=warmup_bundle.delay_history,
-            next_stage="grad_warmup_start",
-            metadata_update={},
-        )
-    else:
-        bundle_start = bundle_eib
+    # part2(EIB) 최종 상태를 그대로 시작점으로 사용한다 (full-state passthrough).
+    # 이전 Patch 26은 warmup(step0) 상태 + EIB params로 재시작했으나, part1→part2와
+    # 동일하게 직전 단계의 settled 상태를 그대로 이어받도록 되돌린다.
+    # warmup_bundle 인자는 하위호환을 위해 받지만 더 이상 상태 치환에 쓰지 않는다.
+    bundle_start = bundle_eib
 
     cache_name = (
         f"grad_{data['cache_tag']}"
@@ -162,6 +150,7 @@ def _run_full_gradient_pure(
     initial_opt_state.coupling.coupling.wLRE = jnp.asarray(clean_params.wLRE)
     initial_opt_state.coupling.coupling.wFFI = jnp.asarray(clean_params.wFFI)
 
+    # Part 3: c_ei는 항상 최적화 대상. freeze_c_ei_after_fic는 Part 2(EIB)에만 적용.
     c_ei_frozen = False
     bold_monitor_opt = bundle_in.build_bold_monitor(cfg)
     fc_target_safe = jnp.asarray(np.nan_to_num(data["fc_target"], nan=0.0))
@@ -190,7 +179,7 @@ def _run_full_gradient_pure(
             cfg.optimizer_global_corr_weight     * L_global
             + cfg.optimizer_nodewise_corr_weight * L_nodewise
             + cfg.optimizer_rmse_weight          * L_rmse
-            + 0.01 * act_l
+            + cfg.optimizer_activity_weight * act_l
         )
 
     def compute_loss_and_metrics(state):
@@ -205,7 +194,7 @@ def _run_full_gradient_pure(
             cfg.optimizer_global_corr_weight     * L_global
             + cfg.optimizer_nodewise_corr_weight * L_nodewise
             + cfg.optimizer_rmse_weight          * L_rmse
-            + 0.01 * act_l
+            + cfg.optimizer_activity_weight * act_l
         )
         return total, L_global, act_l, float(1.0 - L_global)
 
@@ -227,9 +216,11 @@ def _run_full_gradient_pure(
         f"lr={cfg.optimizer_learning_rate}  fc_skip_tr={cfg.optimizer_bold_skip_tr}"
     )
 
-    initial_opt_state.dynamics.c_ei = BoundedParameter(
-        initial_opt_state.dynamics.c_ei, low=0.0, high=20.0
-    )
+    if not c_ei_frozen:
+        initial_opt_state.dynamics.c_ei = BoundedParameter(
+            initial_opt_state.dynamics.c_ei, low=0.0, high=20.0
+        )
+    # frozen: leave c_ei as a plain array so the optimizer never updates it.
     initial_opt_state.coupling.coupling.wLRE = Parameter(
         initial_opt_state.coupling.coupling.wLRE
     )
@@ -265,272 +256,12 @@ def _run_full_gradient_pure(
         skip_tr=cfg.optimizer_bold_skip_tr,
     )
 
-    # Stage handoff: stamp post-grad FC so low-rank reads it as pre-opt FC.
+    # Stamp post-grad FC into metadata for downstream plot continuity.
     candidate_bundle = candidate_bundle.with_metadata({
         "post_grad_fc_matrix": np.asarray(post_opt_fc, dtype=np.float32),
         "post_grad_fc_corr": float(fc_corr(jnp.asarray(post_opt_fc), fc_target_safe)),
         "post_grad_fc_rmse": _compute_rmse_metric(post_opt_fc, data["fc_target"]),
     })
-
-    return {
-        "bundle": candidate_bundle.to_dict(),
-        "loss_history": np.asarray(loss_history, dtype=np.float32),
-        "pre_opt_fc": np.asarray(pre_opt_fc, dtype=np.float32),
-        "post_opt_fc": np.asarray(post_opt_fc, dtype=np.float32),
-        "post_opt_neural": np.asarray(post_opt_neural, dtype=np.float32),
-    }
-
-
-# ══════════════════════════════════════════════════════════════
-# Part 3B — Low-rank gradient optimization
-# ══════════════════════════════════════════════════════════════
-
-class LowRankTrainable(eqx.Module):
-    c_ei:  jnp.ndarray
-    lre_u: jnp.ndarray
-    lre_v: jnp.ndarray
-    ffi_u: jnp.ndarray
-    ffi_v: jnp.ndarray
-
-
-def run_lowrank_optimization(
-    network,
-    bundle_in: StateBundle = None,
-    optimized_state=None,
-    eib_results=None,
-    cfg: Config = None,
-    data: dict = None,
-    warmup_result=None,
-    warmup_bundle: StateBundle = None,  # Patch 26: step-0 warmup start
-) -> StateBundle:
-    """
-    Low-rank correction 최적화를 실행하고 Full Gradient 결과 위에서 바로 StateBundle을 반환한다.
-    """
-    bundle_grad = _coerce_lowrank_bundle(bundle_in, optimized_state, eib_results, cfg, data)
-
-    # Patch 26: optimize from warmup state (step 0) + gradient-tuned params.
-    if warmup_bundle is not None:
-        bundle_start = warmup_bundle.advance(
-            new_params=bundle_grad.params,
-            new_init_dynamics=warmup_bundle.init_dynamics,
-            new_bold_history=warmup_bundle.bold_history,
-            new_bold_window=warmup_bundle.bold_window,
-            new_internal_state=warmup_bundle.internal_state,
-            new_delay_history=warmup_bundle.delay_history,
-            next_stage="lowrank_warmup_start",
-            metadata_update={},
-        )
-    else:
-        bundle_start = bundle_grad
-
-    cache_name = (
-        f"grad_lowrank_{data['cache_tag']}"
-        f"_rank{cfg.lowrank_rank}"
-        f"_TR{cfg.lowrank_bold_window_tr}"
-        f"_STEPS{cfg.lowrank_max_steps}"
-        f"_LR{str(cfg.lowrank_learning_rate).replace('.', 'p')}"
-        f"_ds{str(cfg.lowrank_delta_scale).replace('.', 'p')}"
-        f"_fp{bundle_start.fingerprint()}"
-    )
-
-    @cache(cache_name, redo=False)
-    def _cached_run():
-        return _run_lowrank_pure(network, bundle_start.to_dict(), cfg, data)
-
-    result = _cached_run()
-    bundle_lowrank = StateBundle.from_dict(result["bundle"])
-    bundle_lowrank.apply_to_network(network)
-
-    _plot_gradient_results(
-        bundle_lowrank,
-        np.asarray(result["loss_history"]),
-        data,
-        cfg,
-        pre_opt_fc=np.asarray(result["pre_opt_fc"]),
-        post_opt_fc=np.asarray(result["post_opt_fc"]),
-        title="Part 3B — Low-rank Gradient Optimization",
-    )
-    return bundle_lowrank
-
-
-def _run_lowrank_pure(
-    network,
-    init_dict: dict,
-    cfg: Config,
-    data: dict,
-) -> dict:
-    bundle_in = StateBundle.from_dict(init_dict)
-    rank = cfg.lowrank_rank
-    w_max = cfg.connectivity_weight_max
-    delta_scale = cfg.lowrank_delta_scale
-    n_nodes = data["n_nodes"]
-    sc_mask_np = np.asarray(data["sc_mask"], dtype=np.float32)
-    sc_mask_jnp = jnp.asarray(sc_mask_np)
-    fc_target_safe = jnp.asarray(np.nan_to_num(data["fc_target"], nan=0.0))
-    c_ei_frozen = False
-
-    t1_lr = int(cfg.lowrank_bold_window_tr * cfg.bold_repetition_time_ms)
-    solver = BoundedSolver(Heun(), low=0.0, high=1.0)
-    compiled_model_lr, state_lr_template = bundle_in.to_tvb_state(
-        network,
-        solver,
-        t1=t1_lr,
-        dt=cfg.integration_dt_ms,
-    )
-    bold_monitor_lr = bundle_in.build_bold_monitor(cfg)
-
-    c_ei_base = np.asarray(bundle_in.params.c_ei, dtype=np.float32)
-    wLRE_base = np.asarray(bundle_in.params.wLRE, dtype=np.float32)
-    wFFI_base = np.asarray(bundle_in.params.wFFI, dtype=np.float32)
-
-    key = np.random.RandomState(cfg.lowrank_seed)
-    fi = cfg.lowrank_factor_init
-    init_trainable = LowRankTrainable(
-        c_ei=jnp.asarray(c_ei_base),
-        lre_u=jnp.asarray(key.normal(size=(n_nodes, rank)).astype(np.float32) * fi),
-        lre_v=jnp.asarray(key.normal(size=(n_nodes, rank)).astype(np.float32) * fi),
-        ffi_u=jnp.asarray(key.normal(size=(n_nodes, rank)).astype(np.float32) * fi),
-        ffi_v=jnp.asarray(key.normal(size=(n_nodes, rank)).astype(np.float32) * fi),
-    )
-
-    # Stage handoff: pre-opt FC = predecessor (gradient) stored post-FC for
-    # exact plot continuity; fall back to a fresh sim if the bundle lacks it.
-    pre_opt_fc = bundle_in.metadata.get("post_grad_fc_matrix", None)
-    if pre_opt_fc is None:
-        pre_opt_fc = compute_simulated_fc(
-            network,
-            bundle_in,
-            cfg,
-            sim_duration_ms=t1_lr,
-            skip_tr=cfg.lowrank_bold_skip_tr,
-        )
-
-    def _reconstruct_weights(trainable: LowRankTrainable):
-        delta_lre = delta_scale * (trainable.lre_u @ trainable.lre_v.T)
-        delta_ffi = delta_scale * (trainable.ffi_u @ trainable.ffi_v.T)
-        wLRE_eff = jnp.clip(jnp.asarray(wLRE_base) + delta_lre, 0.0, w_max) * sc_mask_jnp
-        wFFI_eff = jnp.clip(jnp.asarray(wFFI_base) + delta_ffi, 0.0, w_max) * sc_mask_jnp
-        wLRE_eff = 0.5 * (wLRE_eff + wLRE_eff.T)
-        wFFI_eff = 0.5 * (wFFI_eff + wFFI_eff.T)
-        return wLRE_eff, wFFI_eff
-
-    def lowrank_loss_fn(trainable: LowRankTrainable) -> jnp.ndarray:
-        wLRE_eff, wFFI_eff = _reconstruct_weights(trainable)
-        c_ei_eff = jnp.asarray(c_ei_base) if c_ei_frozen else jnp.clip(trainable.c_ei, 0.0, 20.0)
-
-        state = eqx.tree_at(lambda s: s.dynamics.c_ei,          state_lr_template, c_ei_eff)
-        state = eqx.tree_at(lambda s: s.coupling.coupling.wLRE, state,             wLRE_eff)
-        state = eqx.tree_at(lambda s: s.coupling.coupling.wFFI, state,             wFFI_eff)
-
-        sim = compiled_model_lr(state)
-        bold = bold_monitor_lr(sim)
-        fc = _compute_fc_differentiable(bold, cfg.lowrank_bold_skip_tr)
-
-        L_global   = _compute_correlation_loss(fc, fc_target_safe)
-        L_nodewise = _compute_nodewise_corr_loss(fc, fc_target_safe)
-        L_rmse     = _compute_rmse_loss(fc, fc_target_safe)
-        act_l = _compute_activity_regularization(sim, cfg)
-        factor_l = (
-            jnp.mean(trainable.lre_u ** 2) + jnp.mean(trainable.lre_v ** 2)
-            + jnp.mean(trainable.ffi_u ** 2) + jnp.mean(trainable.ffi_v ** 2)
-        )
-        return (
-            cfg.lowrank_global_corr_weight     * L_global
-            + cfg.lowrank_nodewise_corr_weight * L_nodewise
-            + cfg.lowrank_rmse_weight          * L_rmse
-            + cfg.lowrank_activity_weight * act_l
-            + cfg.lowrank_factor_penalty * factor_l
-        )
-
-    lr_optimizer = optax.chain(
-        optax.zero_nans(),
-        optax.clip_by_global_norm(0.1),
-        optax.adamaxw(learning_rate=cfg.lowrank_learning_rate),
-    )
-
-    @eqx.filter_jit
-    def lr_step(trainable, opt_state):
-        loss_value, grads = eqx.filter_value_and_grad(lowrank_loss_fn)(trainable)
-        params = eqx.filter(trainable, eqx.is_array)
-        updates, new_opt_state = lr_optimizer.update(grads, opt_state, params=params)
-        new_trainable = eqx.apply_updates(trainable, updates)
-        return new_trainable, new_opt_state, loss_value
-
-    try:
-        init_loss_lr = float(jnp.nan_to_num(lowrank_loss_fn(init_trainable), nan=1e4))
-    except Exception as error:
-        print(f"[WARN] lowrank initial loss failed: {error}")
-        init_loss_lr = 1e4
-
-    print("\n[LOWRANK] Starting low-rank optimization...")
-    print(
-        f"  rank={rank}  delta_scale={delta_scale}  "
-        f"t1={t1_lr}ms ({t1_lr/1000:.0f}s)  "
-        f"max_steps={cfg.lowrank_max_steps}  lr={cfg.lowrank_learning_rate}"
-    )
-    if c_ei_frozen:
-        print("  c_ei FROZEN: low-rank branch updates only wLRE / wFFI")
-
-    opt_state = lr_optimizer.init(eqx.filter(init_trainable, eqx.is_array))
-    trainable = init_trainable
-    best_loss = float("inf")
-    best_trainable = trainable
-    loss_history = []
-    start_time = time.time()
-
-    print(
-        f"  {'Step':>8} {'Loss':>12} {'BestLoss':>12} "
-        f"{'Step/s':>8} {'Elapsed':>10} {'ETA':>10}"
-    )
-    print("-" * 72)
-
-    for step in range(cfg.lowrank_max_steps):
-        t_step = time.time()
-        trainable, opt_state, loss_value = lr_step(trainable, opt_state)
-        step_loss = float(jnp.nan_to_num(loss_value, nan=init_loss_lr))
-        loss_history.append(step_loss)
-
-        if np.isfinite(step_loss) and step_loss < best_loss:
-            best_loss = step_loss
-            best_trainable = trainable
-
-        if (step + 1) % 10 == 0:
-            elapsed = time.time() - start_time
-            step_per_sec = 1.0 / max(time.time() - t_step, 1e-9)
-            remaining = (elapsed / (step + 1)) * (cfg.lowrank_max_steps - step - 1)
-            print(
-                f"  {step+1:>6}/{cfg.lowrank_max_steps:<6}"
-                f"  {step_loss:>12.6f}"
-                f"  {best_loss:>12.6f}"
-                f"  {step_per_sec:>8.2f}"
-                f"  {_fmt_time(elapsed):>10}"
-                f"  {_fmt_time(remaining):>10}"
-            )
-
-    print("-" * 72)
-    print(f"[LOWRANK] Done!  Best loss: {best_loss:.6f}")
-
-    best_wLRE, best_wFFI = _reconstruct_weights(best_trainable)
-    best_c_ei = np.asarray(jnp.clip(best_trainable.c_ei, 0.0, 20.0), dtype=np.float32)
-
-    best_params = ParamSet(
-        c_ei=best_c_ei,
-        wLRE=np.asarray(best_wLRE, dtype=np.float32),
-        wFFI=np.asarray(best_wFFI, dtype=np.float32),
-        c_ei_frozen=c_ei_frozen,
-    ).sanitize(data["sc_mask"], cfg.connectivity_weight_max)
-
-    candidate_bundle = bundle_in.advance(
-        new_params=best_params,
-        next_stage="lowrank",
-    )
-    post_opt_fc, post_opt_neural = _evaluate_bundle_without_settle(
-        network=network,
-        bundle_in=candidate_bundle,
-        cfg=cfg,
-        sim_duration_ms=t1_lr,
-        skip_tr=cfg.lowrank_bold_skip_tr,
-    )
 
     return {
         "bundle": candidate_bundle.to_dict(),
@@ -629,27 +360,6 @@ def _coerce_gradient_bundle(bundle_in, eib_results, cfg: Config, data: dict, sta
             metadata=eib_results.get("metadata", {"rng_seed": int(cfg.bundle_rng_seed)}),
         )
     raise ValueError("Unsupported eib_results format for run_gradient_optimization().")
-
-
-def _coerce_lowrank_bundle(bundle_in, optimized_state, eib_results, cfg: Config, data: dict) -> StateBundle:
-    if isinstance(bundle_in, StateBundle):
-        return bundle_in
-    if isinstance(optimized_state, StateBundle):
-        return optimized_state
-    if optimized_state is None:
-        raise ValueError("run_lowrank_optimization requires either bundle_in or optimized_state.")
-    return build_bundle_from_legacy_state(
-        state=optimized_state,
-        cfg=cfg,
-        data=data,
-        stage="grad",
-        bold_history=None,
-        bold_window=None,
-        internal_state=capture_internal_state(optimized_state),
-        delay_history=None,
-        c_ei_frozen=False,
-        metadata={"rng_seed": int(cfg.bundle_rng_seed)},
-    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -841,9 +551,9 @@ def _compute_rmse_loss(
 
 
 def _compute_activity_regularization(simulation_result, cfg: Config) -> jnp.ndarray:
-    rE_max = jnp.float32(WilsonCowanEIB.DEFAULT_PARAMS.rE_max_hz)
+    # EI_Tuning loss: target S_e gating (mean over final window)
     mean_e = jnp.mean(simulation_result.data[-500:, 0, :], axis=0)
-    return jnp.mean((rE_max * mean_e - jnp.float32(cfg.fic_target_firing_rate_hz)) ** 2)
+    return jnp.mean((mean_e - jnp.float32(cfg.fic_target_se)) ** 2)
 
 
 def _compute_rmse_metric(predicted: np.ndarray, target: np.ndarray) -> float:
@@ -903,7 +613,9 @@ def _plot_gradient_results(
         axes[0, 0].scatter(0, loss_history[0], s=60, color="steelblue", zorder=5, label="start")
         axes[0, 0].scatter(len(loss_history)-1, loss_history[-1], s=60,
                            color="tomato", zorder=5, label="end")
-    axes[0, 0].set_title("Loss convergence\n(1 − corr + 0.01×activity)")
+    axes[0, 0].set_title(
+        "Loss convergence\n(α·corr + β·node-corr + γ·rmse + w·activity)"
+    )
     axes[0, 0].set_xlabel("Step")
     axes[0, 0].set_ylabel("Loss")
     axes[0, 0].legend()

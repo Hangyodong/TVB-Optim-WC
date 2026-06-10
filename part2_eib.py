@@ -178,13 +178,13 @@ def _run_eib_loop_pure(
         internal_state, metadata = advance_internal_state(tuned_state, metadata)
 
         if not bundle_in.params.c_ei_frozen:
-            mean_excitatory_rate, mean_inhibitory_rate = _extract_firing_rates(
-                step_result, rE_max, rI_max
-            )
+            # EI_Tuning FIC 규칙 (S_e gating per-node)
+            mean_se_node = jnp.mean(step_result.data[:, 0, :], axis=0)
+            mean_si_node = jnp.mean(step_result.data[:, 1, :], axis=0)
             fic_delta = (
                 cfg.eib_internal_fic_learning_rate
-                * mean_inhibitory_rate
-                * (mean_excitatory_rate - cfg.fic_target_firing_rate_hz)
+                * mean_si_node
+                * (mean_se_node - cfg.fic_target_se)
             )
             tuned_state.dynamics.c_ei = jnp.clip(
                 tuned_state.dynamics.c_ei + fic_delta, 0.0, 20.0

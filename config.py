@@ -26,7 +26,7 @@ class Config:
     cache_root_dir: str = "./cache"      # (deprecated; 경로 빌드에 미사용)
     cache_run_label: str = "nor_42"      # 캐시 저장/로드 폴더 이름 → optim/cache/<label>/<cache_tag>
     param_save_dir: str = "./optimized_params"
-    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25_p26_p27_p31_p32capfix"
+    cache_version:  str = "v_eituning_oldlogic_match_p3_p7_p8_p9_pm_p12_p13_p14_ce10_p15_p19_p21_p22_p25_p26_p27_p31_p32capfix_p33segating"
 
     # ── Wilson-Cowan model parameters (Patch 15) ──────────────
     # dataset="human": SanzLeonet 2014 / dataset="mouse": current
@@ -79,11 +79,15 @@ class Config:
     fc_plot_vmax: float =  1.0
 
     # ── Part 1 — FIC ─────────────────────────────────────────
-    fic_target_firing_rate_hz:   float = 4.0
+    # EI_Tuning FIC: S_e gating 을 타깃으로 c_ei(=J_i) per-node 조정.
+    #   d_c_ei = eta * mean_S_i * (mean_S_e - fic_target_se)
+    fic_target_se:               float = 0.25  # FIC 제어 타깃 (S_e gating, EI_Tuning)
+    fic_early_stop_tolerance_se: float = 0.005 # |mean S_e − target| 수렴 허용치
+    fic_target_firing_rate_hz:   float = 4.0   # 진단용 발화율(Hz) 표시 (FIC 제어엔 미사용)
     fic_learning_rate:           float = 1e-3
     fic_max_iterations:          int   = 2000
     fic_early_stop_patience:     int   = 500
-    fic_early_stop_tolerance_hz: float = 0.10
+    fic_early_stop_tolerance_hz: float = 0.10  # (deprecated; tolerance_se 사용)
     fic_step_duration_ms:        int   = 1_000
     fic_step_skip_tr:            int   = 0
     # best 후보 post-hoc 평가용 (EIB posthoc 기본값과 동일)
