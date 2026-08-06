@@ -202,6 +202,24 @@ def _run_single_target(
         finally:
             network.dynamics.dynamics = original_dynamics
 
+        # 자극 타깃 노드의 neural time series CSV. 전 구간(pre+stim), stride 로 다운샘플.
+        # 전 노드×dt1ms 는 조건당 ~1.7GB 라 불가 — 타깃 노드만 남긴다.
+        if getattr(cfg, "dbs_save_neural_csv", False):
+            st = max(1, int(getattr(cfg, "dbs_neural_csv_stride", 4)))
+            nd = np.asarray(simulation_result.data, dtype=np.float32)[::st]
+            sl = np.asarray(stimulation_array, dtype=np.float32)[::st, target_node_index]
+            pd.DataFrame({
+                "time_ms": np.arange(nd.shape[0], dtype=np.float64) * cfg.integration_dt_ms * st,
+                "S_e": nd[:, 0, target_node_index],
+                "S_i": nd[:, 1, target_node_index],
+                "stim": sl[:nd.shape[0]],
+                "is_stim_on": (np.arange(nd.shape[0]) * st >= onset_step).astype(np.int8),
+            }).to_csv(os.path.join(mode_save_dir, "neural_timeseries_target.csv"),
+                      index=False, float_format="%.6g")
+            print(f"[DBS] neural CSV 저장 — {nd.shape[0]} 행 "
+                  f"(stride={st} → {1000.0/(cfg.integration_dt_ms*st):.0f} Hz), "
+                  f"node {target_node_index} ({target_label})", flush=True)
+
         observable_name = "E_plus_I"
         observable_save_dir = os.path.join(mode_save_dir, observable_name)
         os.makedirs(observable_save_dir, exist_ok=True)
@@ -366,11 +384,13 @@ def _analyze_and_plot(
         f"beta pre={beta_ratio_pre:.4f}  during={beta_ratio_during:.4f}"
     )
 
-    _plot_lfp_timeseries(
-        time_axis_ms, lfp_signal, onset_step, stim_end_ms,
-        target_label, derived, cfg, save_dir,
-        stimulus_mode, observable_name,
-    )
+    save_lfp = bool(getattr(cfg, "dbs_save_lfp_timeseries", False))
+    if save_lfp:
+        _plot_lfp_timeseries(
+            time_axis_ms, lfp_signal, onset_step, stim_end_ms,
+            target_label, derived, cfg, save_dir,
+            stimulus_mode, observable_name,
+        )
     _plot_stim_waveform_full(
         time_axis_ms, stimulation_array, target_node_index, target_label,
         derived, save_dir, stimulus_mode,
@@ -385,16 +405,16 @@ def _analyze_and_plot(
         target_label, cfg, save_dir,
         stimulus_mode, observable_name,
     )
-    _plot_lfp_segment_comparison(
-        lfp_pre, lfp_during, target_label, cfg, save_dir,
-        stimulus_mode, observable_name,
-    )
-
-    pd.DataFrame({
-        "time_ms": time_axis_ms,
-        "lfp_e_plus_i": lfp_signal,
-        "stimulus": stimulation_array[:, target_node_index],
-    }).to_csv(os.path.join(save_dir, "lfp_timeseries.csv"), index=False)
+    if save_lfp:
+        _plot_lfp_segment_comparison(
+            lfp_pre, lfp_during, target_label, cfg, save_dir,
+            stimulus_mode, observable_name,
+        )
+        pd.DataFrame({
+            "time_ms": time_axis_ms,
+            "lfp_e_plus_i": lfp_signal,
+            "stimulus": stimulation_array[:, target_node_index],
+        }).to_csv(os.path.join(save_dir, "lfp_timeseries.csv"), index=False)
 
     pd.DataFrame({
         "frequency_hz": freq_pre,
@@ -474,6 +494,18 @@ def _compute_and_save_dbs_fc(
     labels = data.get("region_labels") if isinstance(data, dict) else None
     if not labels or len(labels) != ts.shape[1]:
         labels = [str(i) for i in range(ts.shape[1])]
+
+    # BOLD 시계열 저장 (LFP 대체 출력). TR 해상도라 163노드 × 480 TR ≈ 0.8MB.
+    # segment 열로 FC 계산에 쓰인 pre/during 윈도우를 표시한다(그 외는 skip).
+    if getattr(cfg, "dbs_save_bold_timeseries", True):
+        seg = np.full(n_tr, "skip", dtype=object)
+        seg[pre_lo:pre_hi] = "pre"
+        seg[dur_lo:dur_hi] = "during"
+        bold_df = pd.DataFrame(ts, columns=labels)
+        bold_df.insert(0, "segment", seg)
+        bold_df.insert(0, "time_s", np.arange(n_tr, dtype=np.float32) * tr_ms / 1000.0)
+        bold_df.insert(0, "tr_index", np.arange(n_tr, dtype=np.int32))
+        bold_df.to_csv(os.path.join(save_dir, "bold_timeseries.csv"), index=False)
 
     pd.DataFrame(fc_pre, index=labels, columns=labels).to_csv(
         os.path.join(save_dir, "fc_pre_stim.csv"))

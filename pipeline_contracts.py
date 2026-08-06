@@ -320,22 +320,8 @@ class StateBundle:
         return compiled_model, tvb_state
 
     def build_bold_monitor(self, cfg) -> Bold:
-        # Patch 13: custom HRF kernel parameters
-        _hrf_kernel = LotkaVolterraHRFKernel(
-            tau_s    = getattr(cfg, "bold_hrf_tau_s",    0.8),
-            tau_f    = getattr(cfg, "bold_hrf_tau_f",    0.4),
-            scaling  = getattr(cfg, "bold_hrf_scaling",  1.0 / 3.0),
-            duration = getattr(cfg, "bold_hrf_duration_ms", 20_000.0),
-        )
-        monitor = Bold(
-            period=cfg.bold_repetition_time_ms,
-            downsample_period=4.0,
-            voi=0,
-            history=None,
-            k_1    = getattr(cfg, "bold_hrf_k1", 5.6),
-            V_0    = getattr(cfg, "bold_hrf_V0", 0.02),
-            kernel = _hrf_kernel,
-        )
+        # 커널/params는 make_bold_monitor 단일 소스에서 (build_network warmup과 동일 커널).
+        monitor = make_bold_monitor(cfg, history=None)
         if self._bold_history is None:
             return monitor
         try:
@@ -586,6 +572,52 @@ def advance_internal_state(tvb_state, metadata: Optional[dict] = None) -> Tuple[
     return capture_internal_state(tvb_state), metadata_out
 
 
+def eval_fc_multiseed(eval_model, eval_state, eval_monitor, compute_fc_fn, skip_tr, base_seed, n_seeds):
+    """FC를 n_seeds개 noise draw로 평균. n_seeds<=1 이면 단일 draw(현행과 동일). return (fc_mean, last_sim_result)."""
+    import numpy as _np
+    if n_seeds is None or int(n_seeds) <= 1:
+        res = eval_model(eval_state)
+        return compute_fc_fn(eval_monitor(res), skip_tr), res
+    fcs = []
+    last = None
+    for i in range(int(n_seeds)):
+        internal = eval_state._internal
+        _, subkey = jax.random.split(jax.random.PRNGKey(int(base_seed) + i))
+        internal.noise_samples = jax.random.normal(
+            subkey, jnp.asarray(internal.noise_samples).shape, jnp.asarray(internal.noise_samples).dtype)
+        last = eval_model(eval_state)
+        fcs.append(_np.asarray(compute_fc_fn(eval_monitor(last), skip_tr), dtype=_np.float32))
+    return _np.mean(_np.stack(fcs, axis=0), axis=0), last
+
+
+def make_bold_monitor(cfg, history=None) -> Bold:
+    """cfg HRF 파라미터로 Bold 모니터 생성 — warmup(build_network)과 각 Part가 동일
+    커널을 쓰도록 강제하는 단일 소스.
+
+    두 곳이 서로 다른 커널(예: 기본 20s vs cfg 32s)로 만들어지면 warmup history 길이
+    (kernel_samples = ceil(duration/downsample_period))가 파이프라인 모니터 기대치와
+    어긋나, mode='valid' fftconvolve가 예외 없이 입출력을 swap해 FC 측정이 조용히 깨진다.
+
+    history: NativeSolution이면 Bold.__init__이 downsample→last kernel_samples로 처리.
+             None이면 빈 warm-up(호출부가 tree_at으로 사전처리된 history 주입).
+    """
+    kernel = LotkaVolterraHRFKernel(
+        tau_s    = getattr(cfg, "bold_hrf_tau_s",    0.8),
+        tau_f    = getattr(cfg, "bold_hrf_tau_f",    0.4),
+        scaling  = getattr(cfg, "bold_hrf_scaling",  1.0 / 3.0),
+        duration = getattr(cfg, "bold_hrf_duration_ms", 20_000.0),
+    )
+    return Bold(
+        period=cfg.bold_repetition_time_ms,
+        downsample_period=4.0,
+        voi=0,
+        history=history,
+        k_1    = getattr(cfg, "bold_hrf_k1", 5.6),
+        V_0    = getattr(cfg, "bold_hrf_V0", 0.02),
+        kernel = kernel,
+    )
+
+
 def update_bold_history(monitor, simulation_result):
     if monitor is None or not hasattr(monitor, "history"):
         return monitor
@@ -612,7 +644,180 @@ def extract_bold_window(bold_output) -> np.ndarray:
     return ys
 
 
+# ── Edge-weighted FC loss (subcortex emphasis) ───────────────────
+# W는 off-diagonal edge 가중 행렬(diag 0). block weight가 모두 1.0이면
+# W == (1 - eye)가 되어 아래 함수들은 기존 비가중 corr/rmse와 정확히 동일.
+def weighted_corr_loss(predicted: jnp.ndarray, target: jnp.ndarray, W: jnp.ndarray) -> jnp.ndarray:
+    """1 - (W-가중 Pearson corr). W=(1-eye)일 때 비가중 corr loss와 동치."""
+    n = jnp.maximum(jnp.sum(W), 1.0)
+    p_mean = jnp.sum(W * predicted) / n
+    t_mean = jnp.sum(W * target) / n
+    pc = predicted - p_mean
+    tc = target - t_mean
+    num = jnp.sum(W * pc * tc)
+    den = jnp.sqrt(
+        jnp.maximum(jnp.sum(W * pc ** 2), 1e-10)
+        * jnp.maximum(jnp.sum(W * tc ** 2), 1e-10)
+    )
+    return 1.0 - num / den
+
+
+def weighted_rmse_loss(predicted: jnp.ndarray, target: jnp.ndarray, W: jnp.ndarray) -> jnp.ndarray:
+    """sqrt(W-가중 평균제곱오차). W=(1-eye)일 때 비가중 rmse loss와 동치."""
+    n = jnp.maximum(jnp.sum(W), 1.0)
+    diff = predicted - target
+    return jnp.sqrt(jnp.sum(W * diff ** 2) / n)
+
+
+# ── Block-split corr loss (cc / cross / sub-sub) ─────────────────
+# whole-matrix corr는 edge수 많은 cortex-cortex가 지배 → subcortex fit 안됨.
+# 블록별 corr을 따로 계산해 edge수 무관 동등 가중 → 균형. RMSE는 분할 안 함.
+def prepare_block_corr_terms(block_masks: dict, weights: dict) -> list:
+    """비어있지 않은 블록만 골라 (jnp mask, 정규화 weight) 리스트 반환.
+    subcortex 없는 atlas는 cross/ss 비어 cc(=full off-diag)만 남아 whole corr와 동치.
+    한 번만 호출(static) → loss closure는 jit/eager 양쪽에서 안전."""
+    active = []
+    for key in ("cc", "cross", "subsub"):
+        m = block_masks.get(key)
+        w = float(weights.get(key, 0.0))
+        if m is None or w <= 0.0:
+            continue
+        if float(np.sum(np.asarray(m))) <= 0.0:
+            continue
+        active.append((jnp.asarray(m, dtype=jnp.float32), w))
+    total_w = sum(w for _, w in active)
+    if total_w <= 0.0:
+        raise ValueError("prepare_block_corr_terms: 활성 블록 없음 (모든 mask/weight=0)")
+    return [(m, w / total_w) for m, w in active]
+
+
+def block_corr_loss(predicted: jnp.ndarray, target: jnp.ndarray, terms: list) -> jnp.ndarray:
+    """blockwise (1 - W-가중 Pearson corr)의 가중합. terms=prepare_block_corr_terms(...)."""
+    total = jnp.asarray(0.0, dtype=jnp.float32)
+    for m, w in terms:
+        total = total + jnp.float32(w) * weighted_corr_loss(predicted, target, m)
+    return total
+
+
+def block_rmse_loss(predicted: jnp.ndarray, target: jnp.ndarray, terms: list) -> jnp.ndarray:
+    """blockwise RMSE의 가중합. terms=prepare_block_corr_terms(...) 재사용(cc/cross/ss).
+    plain RMSE는 edge수 많은 cortex-cortex가 지배 → block_corr와 동일 동기로 블록별
+    RMSE를 edge수 무관 동등 가중. subcortex 없는 atlas는 cc만 활성 → plain off-diag RMSE와 동치.
+    각 블록 RMSE=sqrt(블록 edge 평균제곱오차), terms의 정규화 weight로 합산."""
+    diff2 = (predicted - target) ** 2
+    total = jnp.asarray(0.0, dtype=jnp.float32)
+    for m, w in terms:
+        n = jnp.maximum(jnp.sum(m), 1.0)
+        total = total + jnp.float32(w) * jnp.sqrt(jnp.sum(m * diff2) / n)
+    return total
+
+
+def nodewise_corr_loss(
+    predicted: jnp.ndarray, target: jnp.ndarray, W: jnp.ndarray, node_w: jnp.ndarray
+) -> jnp.ndarray:
+    """행별 W-가중 corr → node_w 가중 평균한 (1 - corr) loss.
+    W=(1-eye), node_w 균일이면 기존(대각 제외, 노드 균일 평균)과 동치.
+    part2 선택 score와 part3 gradient loss가 동일 nodewise 항을 쓰도록 공유."""
+    n = predicted.shape[0]
+
+    def _row_corr(i):
+        w = W[i]
+        x = predicted[i]
+        y = target[i]
+        n_eff = jnp.maximum(jnp.sum(w), 1.0)
+        xm = x - jnp.sum(w * x) / n_eff
+        ym = y - jnp.sum(w * y) / n_eff
+        num = jnp.sum(w * xm * ym)
+        den = jnp.sqrt(
+            jnp.maximum(jnp.sum(w * xm ** 2), 1e-10)
+            * jnp.maximum(jnp.sum(w * ym ** 2), 1e-10)
+        )
+        return num / den
+
+    row_corrs = jax.vmap(_row_corr)(jnp.arange(n))
+    return 1.0 - jnp.sum(node_w * row_corrs) / jnp.maximum(jnp.sum(node_w), 1.0)
+
+
+# ── Block-wise FC corr (진단/플롯용, 순수 numpy) ──────────────────
+def _flat_pearson(p_block: np.ndarray, t_block: np.ndarray) -> float:
+    pf = np.asarray(p_block, dtype=np.float64).ravel()
+    tf = np.asarray(t_block, dtype=np.float64).ravel()
+    m = np.isfinite(pf) & np.isfinite(tf)
+    if int(m.sum()) < 2:
+        return float("nan")
+    pf, tf = pf[m], tf[m]
+    if pf.std() < 1e-8 or tf.std() < 1e-8:
+        return float("nan")
+    return float(np.corrcoef(pf, tf)[0, 1])
+
+
+def compute_block_corrs(fc_pred, fc_target, cortex_idx, subcortex_idx) -> Dict[str, float]:
+    """full / cortex-cortex / cross(ctx↔sub) / sub-sub 블록별 off-diag Pearson corr."""
+    p = np.asarray(fc_pred, dtype=np.float64)
+    t = np.asarray(fc_target, dtype=np.float64)
+    n = p.shape[0]
+    ci = np.asarray(cortex_idx, dtype=np.int64)
+    si = np.asarray(subcortex_idx, dtype=np.int64)
+
+    def _block(ri, cj, drop_diag):
+        pb = p[np.ix_(ri, cj)].copy()
+        tb = t[np.ix_(ri, cj)].copy()
+        if drop_diag:
+            d = np.eye(pb.shape[0], pb.shape[1], dtype=bool)
+            pb[d] = np.nan
+            tb[d] = np.nan
+        return _flat_pearson(pb, tb)
+
+    full = _block(np.arange(n), np.arange(n), drop_diag=True)
+    return {
+        "full":  full,
+        "ctx":   _block(ci, ci, True) if ci.size else float("nan"),
+        "cross": _block(ci, si, False) if (ci.size and si.size) else float("nan"),
+        "sub":   _block(si, si, True) if si.size else float("nan"),
+    }
+
+
+def plot_block_corr_bars(ax, pre_fc, post_fc, fc_target, cortex_idx, subcortex_idx,
+                         title="Block-wise FC corr") -> Tuple[dict, dict]:
+    """ax에 pre/post 블록별 corr 그룹 막대. matplotlib는 호출부가 만든 ax로 주입."""
+    pre = compute_block_corrs(pre_fc, fc_target, cortex_idx, subcortex_idx)
+    post = compute_block_corrs(post_fc, fc_target, cortex_idx, subcortex_idx)
+    keys = ["full", "ctx", "cross", "sub"]
+    labels = ["full", "ctx-ctx", "cross", "sub-sub"]
+    x = np.arange(len(keys))
+    w = 0.38
+    ax.bar(x - w / 2, [pre[k] for k in keys], w, label="pre", color="silver")
+    ax.bar(x + w / 2, [post[k] for k in keys], w, label="post", color="steelblue")
+    for xi, k in enumerate(keys):
+        ax.text(xi + w / 2, post[k], f"{post[k]:.2f}", ha="center",
+                va="bottom" if post[k] >= 0 else "top", fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("FC correlation")
+    ax.set_title(title)
+    ax.axhline(0, color="k", linewidth=0.6)
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.3)
+    return pre, post
+
+
+def _delay_tail_len(network) -> Optional[int]:
+    """DDE 지연 버퍼는 마지막 max_delay 구간만 쓰인다(network.get_history). 게다가 bundle 의
+    delay_history 는 cross-process restore 에 사용되지 않는다(update_history 는 solution.ys 를
+    요구하는데 restore_network_delay_history 는 .data payload 를 넘겨 항상 no-op). 따라서
+    warmup 전체 trajectory(수백 MB)를 저장할 필요 없이 max_delay 를 덮는 tail 만 보존한다.
+    dt=1ms 가정(모든 러너 integration_dt_ms=1.0). max_delay 없거나 0(지연없음)이면 None=전체 유지."""
+    md = getattr(network, "max_delay", None)
+    if md is None:
+        graph = getattr(network, "graph", None)
+        md = getattr(graph, "max_delay", None)
+    if md is None or md <= 0:
+        return None
+    return int(md) + 256   # generous margin
+
+
 def capture_network_delay_history(network) -> Optional[np.ndarray]:
+    tail = _delay_tail_len(network)
     for attr_name in ("history", "_history"):
         if not hasattr(network, attr_name):
             continue
@@ -623,9 +828,13 @@ def capture_network_delay_history(network) -> Optional[np.ndarray]:
         if attr_value is None:
             continue
         try:
-            if hasattr(attr_value, "data"):
-                return np.asarray(attr_value.data, dtype=np.float32)
-            return np.asarray(attr_value, dtype=np.float32)
+            raw = attr_value.data if hasattr(attr_value, "data") else attr_value
+            if tail is not None:
+                try:
+                    raw = raw[-tail:]      # device-side slice → host 전송량·pkl 크기 최소화
+                except Exception:
+                    pass
+            return np.asarray(raw, dtype=np.float32)
         except Exception:
             continue
     return None

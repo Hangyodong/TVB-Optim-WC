@@ -248,6 +248,15 @@ def make_config(dataset: str) -> Config:
         optimizer_nodewise_corr_weight      = 0.40,
         optimizer_rmse_weight               = 0.20,
 
+        # ── Subcortex FC fitting emphasis: 블록 loss 점유율(합=1) ─
+        # whole-brain corr의 cortex-cortex 쏠림 완화. balanced=0.50/0.40/0.10.
+        # per-edge 가중은 data_loader가 atlas edge수로 환산(216/416 동일 동작).
+        # mouse Atlas_43은 cortex/subcortex 분리되면 적용, 안 되면 자동 off.
+        # 바꾸면 cache 무효화 위해 cache_version도 갱신할 것.
+        fc_block_share_cortex               = 0.50,
+        fc_block_share_cross                = 0.40,
+        fc_block_share_subsub               = 0.10,
+
         # ── Part 4 — DBS ─────────────────────────────────────────
         dbs_target_regions           = p["dbs_target_regions"],
         dbs_pulse_amplitude                 = 10.0,

@@ -1,25 +1,30 @@
 """
 model.py
-WilsonCowanEIB 다이나믹스, EIBLinearCoupling 정의 및 네트워크 빌드.
+ReducedWongWangEIB 다이나믹스, EIBLinearCoupling 정의 및 네트워크 빌드.
 
 Stage 3
 -------
 - build_network()는 data["graph"]가 있으면 그대로 사용한다.
-- data_loader.py가 DenseDelayGraph를 제공하면 tract delay가 자동으로 네트워크에 반영된다.
+- NOTE: tract delay는 cfg.use_delay 로 켜고 끈다(기본 True). True면 EIBDelayedCoupling
+  (DelayedCoupling)이 data["delays"](=lengths/conduction_speed)를 히스토리 버퍼 조회에
+  반영한다(DDE/SDDE). False면 coupling이 InstantaneousCoupling이라 DenseDelayGraph를
+  넣어도 delays가 무시되고 delay-free ODE/SDE가 된다.
 """
 import jax
 import jax.numpy as jnp
 
 from tvboptim.experimental.network_dynamics import Network, prepare
 from tvboptim.experimental.network_dynamics.core.bunch import Bunch
-from tvboptim.experimental.network_dynamics.coupling.base import InstantaneousCoupling
+from tvboptim.experimental.network_dynamics.coupling.base import (
+    DelayedCoupling,
+    InstantaneousCoupling,
+)
 from tvboptim.experimental.network_dynamics.dynamics.base import AbstractDynamics
 from tvboptim.experimental.network_dynamics.graph import DenseGraph
 from tvboptim.experimental.network_dynamics.noise import AdditiveNoise
 from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
-from tvboptim.observations.tvb_monitors.bold import Bold
-
 from config import Config
+from pipeline_contracts import make_bold_monitor
 
 
 def _rww_H(x, d):
@@ -33,7 +38,12 @@ def _rww_H(x, d):
     dx = d * x
     near = jnp.abs(dx) < 1e-4
     safe_x = jnp.where(near, 1.0, x)               # bad-branch 입력을 0에서 떨어뜨림
-    H_full = safe_x / (1.0 - jnp.exp(-d * safe_x))
+    # float32 exp 오버플로 방지: x 가 강한 음수(포화 노드의 강한 억제)면 -d·safe_x 가 큰
+    # 양수 → exp 가 inf → forward 는 유한(H→0)이지만 backward 가 inf 연산 → NaN → gradient
+    # 전체가 NaN(→ zero_nans 로 0 → 최적화 정지). 큰 |x| 에서 H 는 이미 포화라 clip 이
+    # forward 를 거의 안 바꾼다(x≫0→x, x≪0→0). exp(±80) 은 float32 안전범위.
+    exp_arg = jnp.clip(-d * safe_x, -80.0, 80.0)
+    H_full = safe_x / (1.0 - jnp.exp(exp_arg))
     return jnp.where(near, 1.0 / d, H_full)
 
 
@@ -147,6 +157,20 @@ class EIBLinearCoupling(InstantaneousCoupling):
         return summed_inputs
 
 
+class EIBDelayedCoupling(DelayedCoupling):
+    """EIBLinearCoupling 의 delay(DDE) 버전.
+
+    pre() 가 받는 delayed_states[i] 는 [n_target, n_source] 2D 라서 wLRE/wFFI (n,n) 와
+    elementwise 로 맞는다(instantaneous 는 [n_source] 브로드캐스트). 식은 동일.
+    """
+
+    N_OUTPUT_STATES = 2
+    DEFAULT_PARAMS = Bunch(wLRE=1.0, wFFI=1.0)
+
+    pre = EIBLinearCoupling.pre
+    post = EIBLinearCoupling.post
+
+
 def build_network(cfg: Config, data: dict) -> tuple:
     """
     네트워크를 생성하고 초기 워밍업 시뮬레이션을 실행한다.
@@ -161,15 +185,23 @@ def build_network(cfg: Config, data: dict) -> tuple:
     if graph is None:
         graph = DenseGraph(data["weights"], region_labels=data["region_labels"])
 
-    # RWW local dynamics (EI_Tuning.ipynb). RWW 파라미터는 dataset 무관 상수라
-    # DEFAULT_PARAMS 를 그대로 쓴다 (구 WC 의 cfg.wc_* override 루프 제거).
+    # RWW local dynamics (EI_Tuning.ipynb). 파라미터는 cfg.rww_* 에서 읽는다
+    # (getattr 기본값 = DEFAULT_PARAMS 동일값 → cfg 에 없어도 동작 불변).
     # c_ei(=J_i) 만 per-node 로 두고 cfg.wc_c_ei_init 으로 초기화 (FIC 가 조정).
     _c_ei_init = float(getattr(cfg, "wc_c_ei_init", 1.0))
+    _dp = ReducedWongWangEIB.DEFAULT_PARAMS
+    _rww = {k: float(getattr(cfg, f"rww_{k}", _dp[k]))
+            for k in ("a_e", "b_e", "d_e", "gamma_e", "tau_e", "w_p", "W_e",
+                      "a_i", "b_i", "d_i", "gamma_i", "tau_i", "W_i",
+                      "J_N", "I_o", "I_ext", "lamda", "rE_max_hz", "rI_max_hz")}
     dynamics = ReducedWongWangEIB(
-        c_ei=_c_ei_init * jnp.ones((n_nodes,), dtype=jnp.float32)
+        c_ei=_c_ei_init * jnp.ones((n_nodes,), dtype=jnp.float32),
+        **_rww,
     )
 
-    coupling = EIBLinearCoupling(incoming_states=["E"])
+    _use_delay = bool(getattr(cfg, "use_delay", False))
+    _coupling_cls = EIBDelayedCoupling if _use_delay else EIBLinearCoupling
+    coupling = _coupling_cls(incoming_states=["E"])
     coupling.params.wLRE = jnp.ones((n_nodes, n_nodes), dtype=jnp.float32)
     coupling.params.wFFI = jnp.ones((n_nodes, n_nodes), dtype=jnp.float32)
 
@@ -202,11 +234,9 @@ def build_network(cfg: Config, data: dict) -> tuple:
     print(f"[MODEL] Warmup done — E mean={final_e_mean:.4f}  I mean={final_i_mean:.4f}")
     print(f"[MODEL] Graph type: {type(graph).__name__}")
 
-    bold_monitor = Bold(
-        period=cfg.bold_repetition_time_ms,
-        downsample_period=4.0,
-        voi=0,
-        history=warmup_result,
-    )
+    # BOLD 모니터는 각 Part의 build_bold_monitor와 동일 커널을 써야 한다(make_bold_monitor
+    # 단일 소스). 커널 duration이 어긋나면 warmup history 길이가 kernel_samples와 안 맞아
+    # mode='valid' 합성곱이 조용히 깨진다(과거 기본 20s ↔ cfg 32s 불일치 버그).
+    bold_monitor = make_bold_monitor(cfg, history=warmup_result)
 
     return network, initial_state, bold_monitor, warmup_result

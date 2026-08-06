@@ -4,9 +4,29 @@ optimized_params/
 dbs_analysis/
 dbs_analysis_nor/
 figures_*/
+figures/
+part_figures_*/
 paper_dbs_psd_*/
 paper_figures_*/
 all_figures_export_*/
+
+# 실행 산출물 — DBS 스윕 하나가 13GB 다
+output_ppmi_pd/
+output_ppmi_ctr/
+output_hcp/
+anaconda_projects/
+
+# 입력 데이터 (AALv3 478MB, Schaeffer 722MB)
+data/
+mouse/
+nor/
+pd/
+
+# 노트북이 뱉는 그림·패키징 산출물
+[0-9][0-9][0-9]_*.png
+hyp_*.png
+edgefit_*.png
+*.tar.gz
 *.zip
 *.log
 *.csv

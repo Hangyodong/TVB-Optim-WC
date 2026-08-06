@@ -196,6 +196,14 @@ def make_config(dataset: str) -> Config:
         optimizer_nodewise_corr_weight      = 0.40,
         optimizer_rmse_weight               = 0.20,
 
+        # ── Subcortex FC fitting emphasis: 블록 loss 점유율(합=1) ─
+        # mouse CHA 22노드 라벨(FRO_/BG_/THL_)은 cortex prefix(7Networks_/Cortex_)
+        # 매칭 안 돼 전부 1블록 → W 균일 → 자동 off. 켜려면 data_loader.
+        # _CORTEX_LABEL_PREFIXES에 CHA cortex 규칙 추가. 값은 그대로 둬도 무해.
+        fc_block_share_cortex               = 0.50,
+        fc_block_share_cross                = 0.40,
+        fc_block_share_subsub               = 0.10,
+
         # ── Part 4 — DBS ─────────────────────────────────────────
         dbs_target_regions           = p["dbs_target_regions"],
         dbs_pulse_amplitude                 = 10.0,

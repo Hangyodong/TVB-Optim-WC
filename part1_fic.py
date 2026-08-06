@@ -9,6 +9,7 @@ Stage 3
   delay_history를 함께 저장한다.
 - legacy notebook의 old-style 호출도 계속 허용한다.
 """
+import collections
 import heapq
 import time
 
@@ -31,6 +32,7 @@ from pipeline_contracts import (
     build_bundle_from_legacy_state,
     capture_internal_state,
     capture_network_delay_history,
+    eval_fc_multiseed,
     extract_bold_window,
     sync_network_delay_history,
     update_bold_history,
@@ -82,6 +84,14 @@ def run_fic(
     result = _cached_run()
 
     bundle_fic = StateBundle.from_dict(result["bundle"])
+    # freeze 플래그는 cfg 로부터 재적용. FIC 캐시엔 c_ei 계산결과만 담기고 freeze 는
+    # cache_name 에 없으므로, 캐시hit 시 구 플래그가 딸려온다. 여기서 cfg 값으로 덮어써
+    # 캐시 무효화(FIC 재계산) 없이 freeze 를 반영한다. c_ei 값 자체는 불변.
+    _want_frozen = bool(getattr(cfg, "freeze_c_ei_after_fic", False))
+    if bool(bundle_fic.params.c_ei_frozen) != _want_frozen:
+        _p = bundle_fic.params
+        bundle_fic = bundle_fic.with_params(
+            ParamSet(c_ei=_p.c_ei, wLRE=_p.wLRE, wFFI=_p.wFFI, c_ei_frozen=_want_frozen))
     bundle_fic.apply_to_network(network)
 
     print(
@@ -127,13 +137,17 @@ def _run_fic_loop_pure(
     mean_E_history = []
     mean_firing_rate_history = []
     consecutive_convergence_count = 0
+    # se_error 는 2.5s 창 하나에서 나온 값이라 노이즈가 크다 → 이동평균으로 판정.
+    _es_win = int(getattr(cfg, "fic_early_stop_window", 50))
+    se_recent = collections.deque(maxlen=max(1, _es_win))
+    se_smooth = float("inf")
     start_time = time.time()
 
     # best 후보 선택용: rE 오차가 작은 top_k step만 스냅샷을 materialize한다.
     # 매 step 전체 state를 to_dict()로 직렬화하던 것(특히 매 step 커지는 bold_history의
     # host 전송)을 후보 자격을 얻은 step에서만 수행하도록 줄인다.
     # max-heap을 (-rE_error, step_index, bundle_dict)로 유지 → rE 오차 최소 top_k 보존.
-    top_k = 10
+    top_k = int(getattr(cfg, "fic_posthoc_top_k", 10))
     fic_topk_heap = []
     n_steps_completed = 0
 
@@ -232,9 +246,12 @@ def _run_fic_loop_pure(
             tuned_state.dynamics.c_ei + update_delta, 0.0, 20.0
         )
 
+        se_recent.append(se_error)
+        se_smooth = (float(np.mean(se_recent)) if len(se_recent) == se_recent.maxlen
+                     else float("inf"))
         consecutive_convergence_count = (
             consecutive_convergence_count + 1
-            if se_error < cfg.fic_early_stop_tolerance_se
+            if se_smooth < cfg.fic_early_stop_tolerance_se
             else 0
         )
 
@@ -245,11 +262,14 @@ def _run_fic_loop_pure(
                 f"  mean_S_e={current_mean_E:.4f}"
                 f"  rE={current_mean_rate:.3f} Hz"
                 f"  se_err={se_error:.4f}"
+                f"  se_ma={se_smooth:.4f}"
                 f"  ({elapsed:.1f}s)"
             )
 
         if consecutive_convergence_count >= cfg.fic_early_stop_patience:
-            print(f"[FIC] Early stop at step {step_index + 1}")
+            print(f"[FIC] Early stop at step {step_index + 1}  "
+                  f"(se 이동평균 {se_smooth:.4f} < {cfg.fic_early_stop_tolerance_se} "
+                  f"가 {cfg.fic_early_stop_patience} step 연속)")
             break
 
     # ── best 후보 선택 (Part 2 post-hoc validation 방식) ─────────
@@ -388,14 +408,15 @@ def _run_fic_loop_pure(
         "post_fic_fc_rmse": float(post_fic_rmse),
     })
 
+    _ns = max(1, int(getattr(cfg, "neural_cache_stride", 1)))   # cache 경량화(plot 전용 trace)
     return {
         "bundle": bundle_fic.to_dict(),
         "bold_signal": bold_signal_arr,
         "final_rE_hz": float(final_rate),
         "mean_rE_hz_history": mean_rE_hz_arr,
         "mean_E_history": mean_E_arr,
-        "pre_fic_neural": np.asarray(pre_fic_result.data, dtype=np.float32),
-        "post_fic_neural": post_fic_neural,
+        "pre_fic_neural": np.asarray(pre_fic_result.data, dtype=np.float32)[::_ns],
+        "post_fic_neural": post_fic_neural[::_ns],
         "pre_fic_fc": np.asarray(pre_fic_fc, dtype=np.float32),
         "pre_fic_fc_corr": float(pre_fic_corr),
         "pre_fic_fc_rmse": float(pre_fic_rmse),
@@ -433,10 +454,11 @@ def _evaluate_fic_candidate_bundle(
     )
     bold_monitor = candidate_bundle.build_bold_monitor(cfg)
 
-    sim_result = sim_model(sim_state)
+    fc_matrix, sim_result = eval_fc_multiseed(
+        sim_model, sim_state, bold_monitor, _compute_fc_from_bold_output, skip_tr,
+        int(cfg.bundle_rng_seed), int(getattr(cfg, "fc_eval_n_seeds", 1)))
     bold_output = bold_monitor(sim_result)
 
-    fc_matrix = _compute_fc_from_bold_output(bold_output, skip_tr)
     sim_state.initial_state.dynamics = sim_result.data[-1]
     bold_monitor = update_bold_history(bold_monitor, sim_result)
     internal_state, metadata = advance_internal_state(sim_state, candidate_bundle.metadata)
